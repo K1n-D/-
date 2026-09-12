@@ -153,6 +153,9 @@ class CollectorEndToEnd(unittest.TestCase):
         heartbeat = [p for topic, p, _ in device.client.published if topic.endswith("/heartbeat")]
         self.assertEqual(heartbeat[0]["deviceCode"], "M-TEST")
 
+class SlaveDownTests(unittest.TestCase):
+    """Needs no slave fixture, so it must not inherit the CollectorEndToEnd setUp."""
+
     def test_read_point_returns_clean_error_when_slave_is_down(self):
         dead_port = free_port()
         from pymodbus.client import ModbusTcpClient

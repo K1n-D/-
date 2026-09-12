@@ -1,2 +1,2 @@
-pymodbus>=3.9,<4
+pymodbus==3.9.2
 pyyaml>=6
