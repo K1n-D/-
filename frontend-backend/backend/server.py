@@ -19,8 +19,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Alarm thresholds are configuration, not code.
-ALARM_TEMPERATURE_THRESHOLD = float(os.getenv("IOT_ALARM_TEMPERATURE_THRESHOLD", "90"))
+# Alarm rules live in iot_alarm_rule (see RULE_ENGINE below); no hardcoded
+# thresholds here any more.
 MAX_ALARMS = int(os.getenv("IOT_MAX_ALARMS", "200"))
 
 # Set IOT_AUTH_ENABLED=1 to require a Bearer token on data APIs. Off by default
@@ -256,21 +256,42 @@ class Persistence:
                 })
             return result
 
-    def alarm_triggered(self, device_code, value, threshold):
+    def alarm_triggered(self, device_code, point_code, value, threshold, level):
         self.execute(
             """INSERT INTO iot_alarm_record
                (device_code, point_code, alarm_type, alarm_level, trigger_value,
                 threshold_value, status, trigger_time)
-               VALUES (%s,'temperature','THRESHOLD','SERIOUS',%s,%s,'ACTIVE',%s)""",
-            (device_code, value, threshold, utcnow_naive()),
+               VALUES (%s,%s,'THRESHOLD',%s,%s,%s,'ACTIVE',%s)""",
+            (device_code, point_code, level, value, threshold, utcnow_naive()),
         )
 
-    def alarm_resolved(self, device_code):
+    def alarm_resolved(self, device_code, point_code):
         self.execute(
             """UPDATE iot_alarm_record SET status='RESOLVED', recover_time=%s
-               WHERE device_code=%s AND point_code='temperature' AND status='ACTIVE'""",
-            (utcnow_naive(), device_code),
+               WHERE device_code=%s AND point_code=%s AND status='ACTIVE'""",
+            (utcnow_naive(), device_code, point_code),
         )
+
+    def alarm_acked(self, device_code, point_code):
+        self.execute(
+            """UPDATE iot_alarm_record SET ack_time=%s
+               WHERE id = (SELECT id FROM (
+                     SELECT id FROM iot_alarm_record
+                     WHERE device_code=%s AND point_code=%s AND status='ACTIVE'
+                     ORDER BY id DESC LIMIT 1) latest)""",
+            (utcnow_naive(), device_code, point_code),
+        )
+
+    def alarm_rule_rows(self):
+        """Raw rule rows for the engine (id + numeric fields), None if DB down."""
+        rows = self.query(
+            """SELECT id, device_code, point_code, operator, threshold,
+                      duration_sec, hysteresis, level, enabled FROM iot_alarm_rule""")
+        if rows is None:
+            return None
+        return [{"id": r[0], "device_code": r[1], "point_code": r[2], "operator": r[3],
+                 "threshold": float(r[4]), "duration_sec": r[5], "hysteresis": float(r[6]),
+                 "level": r[7], "enabled": bool(r[8])} for r in rows]
 
     def heartbeat(self, payload):
         self.execute(
@@ -356,26 +377,81 @@ def load_persisted_registry():
             DATA["devices"].setdefault(code, {"deviceCode": code, "status": "OFFLINE", "points": {}})
 
 
-def evaluate_temperature_alarm(code, value):
-    """Open a SERIOUS alarm above the threshold and resolve it once the value
-    falls back; alarms were previously write-only and never recovered."""
-    active = [a for a in DATA["alarms"]
-              if a["deviceCode"] == code and a["pointCode"] == "temperature" and a["status"] == "ACTIVE"]
-    if value > ALARM_TEMPERATURE_THRESHOLD:
-        if not active:
-            DATA["alarms"].append({"deviceCode": code, "pointCode": "temperature", "level": "SERIOUS",
-                                   "value": value, "threshold": ALARM_TEMPERATURE_THRESHOLD,
-                                   "status": "ACTIVE", "time": time.time()})
-            DB.alarm_triggered(code, value, ALARM_TEMPERATURE_THRESHOLD)
-            logging.warning("alarm OPEN device=%s value=%s threshold=%s", code, value, ALARM_TEMPERATURE_THRESHOLD)
-        elif value > active[0]["value"]:
-            active[0]["value"] = value  # keep the worst reading while active
-    else:
-        for alarm in active:
-            alarm["status"] = "RESOLVED"
-            alarm["recoveredAt"] = time.time()
-            DB.alarm_resolved(code)
-            logging.info("alarm RESOLVED device=%s value=%s", code, value)
+# Rule-driven alarm engine. Rules come from iot_alarm_rule (device '*' is a
+# wildcard); state tracks how long each rule/device has been in breach so a
+# rule with duration_sec only fires after a sustained violation, and the
+# hysteresis band prevents flapping around the threshold.
+RULE_ENGINE = {"rules": [], "loadedAt": 0.0, "state": {}}
+RULE_RELOAD_SECONDS = 30.0
+OPERATORS = (">", ">=", "<", "<=")
+
+
+def load_rules(force=False):
+    now = time.time()
+    if not force and now - RULE_ENGINE["loadedAt"] < RULE_RELOAD_SECONDS:
+        return
+    rows = DB.alarm_rule_rows()
+    if rows is not None:
+        RULE_ENGINE["rules"] = rows
+        RULE_ENGINE["loadedAt"] = now
+
+
+def rule_matches(rule, code, point):
+    return rule["point_code"] == point and rule["device_code"] in ("*", code)
+
+
+def rule_violated(rule, value):
+    if rule["operator"] == ">":
+        return value > rule["threshold"]
+    if rule["operator"] == ">=":
+        return value >= rule["threshold"]
+    if rule["operator"] == "<":
+        return value < rule["threshold"]
+    if rule["operator"] == "<=":
+        return value <= rule["threshold"]
+    return False
+
+
+def evaluate_rules(code, point, value, now):
+    """Run every matching rule for one reading; open, sustain and resolve alarms."""
+    load_rules()
+    for rule in RULE_ENGINE["rules"]:
+        if not rule.get("enabled", True) or not rule_matches(rule, code, point):
+            continue
+        key = (rule["id"], code)
+        state = RULE_ENGINE["state"].setdefault(key, {"since": None, "active": False})
+        violated = rule_violated(rule, value)
+        if not state["active"]:
+            if not violated:
+                state["since"] = None
+                continue
+            if state["since"] is None:
+                state["since"] = now
+            if now - state["since"] >= rule["duration_sec"]:
+                state["active"] = True
+                DATA["alarms"].append({"deviceCode": code, "pointCode": point,
+                                       "level": rule["level"], "value": value,
+                                       "threshold": rule["threshold"], "ruleId": rule["id"],
+                                       "status": "ACTIVE", "ack": False, "time": now})
+                DB.alarm_triggered(code, point, value, rule["threshold"], rule["level"])
+                logging.warning("alarm OPEN device=%s point=%s value=%s rule=%s threshold=%s",
+                                code, point, value, rule["id"], rule["threshold"])
+        else:
+            # Recovery needs to cross the hysteresis band below the threshold.
+            if rule["operator"] in (">", ">="):
+                recovered = value < rule["threshold"] - rule["hysteresis"]
+            else:
+                recovered = value > rule["threshold"] + rule["hysteresis"]
+            if recovered:
+                state["active"] = False
+                state["since"] = None
+                for alarm in DATA["alarms"]:
+                    if (alarm["deviceCode"] == code and alarm["pointCode"] == point
+                            and alarm.get("ruleId") == rule["id"] and alarm["status"] == "ACTIVE"):
+                        alarm["status"] = "RESOLVED"
+                        alarm["recoveredAt"] = now
+                DB.alarm_resolved(code, point)
+                logging.info("alarm RESOLVED device=%s point=%s value=%s", code, point, value)
 
 
 def process_message(topic, payload):
@@ -421,8 +497,8 @@ def process_message(topic, payload):
             d["status"] = "ONLINE"
             DB.telemetry(payload)
             value = payload.get("value")
-            if payload["pointCode"] == "temperature" and isinstance(value, (int, float)) and not isinstance(value, bool):
-                evaluate_temperature_alarm(code, value)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                evaluate_rules(code, payload["pointCode"], value, time.time())
             return
         if "/heartbeat" in topic:
             code = payload.get("deviceCode")
@@ -571,6 +647,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/alarms/ack":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                return self.send_json({"error": "invalid request"}, 400)
+            code, point = body.get("deviceCode"), body.get("pointCode")
+            if not code or not point:
+                return self.send_json({"error": "deviceCode/pointCode required"}, 400)
+            now = time.time()
+            with LOCK:
+                acked = [a for a in DATA["alarms"]
+                         if a["deviceCode"] == code and a["pointCode"] == point and a["status"] == "ACTIVE"]
+                for alarm in acked:
+                    alarm["ack"] = True
+                    alarm["ackTime"] = now
+            DB.alarm_acked(code, point)
+            return self.send_json({"ok": True, "acked": len(acked)})
         if path == "/api/auth/login":
             try:
                 length = int(self.headers.get("Content-Length", "0"))

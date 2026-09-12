@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,18 @@ os.environ.setdefault("IOT_DB_ENABLED", "0")  # keep unit tests off the real MyS
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # backend/ containing server.py
 import server
 from iot_middleware.normalization import normalize
+
+
+def install_rule(**overrides):
+    """Inject an in-memory rule so tests do not depend on the database."""
+    rule = {"id": 1, "device_code": "*", "point_code": "temperature", "operator": ">",
+            "threshold": 90.0, "duration_sec": 0, "hysteresis": 5.0,
+            "level": "SERIOUS", "enabled": True}
+    rule.update(overrides)
+    server.RULE_ENGINE["rules"] = [rule]
+    server.RULE_ENGINE["loadedAt"] = time.time()  # prevent a reload from the (disabled) DB
+    server.RULE_ENGINE["state"] = {}
+    return rule
 
 
 class NormalizeTests(unittest.TestCase):
@@ -38,6 +51,9 @@ class ProcessMessageTests(unittest.TestCase):
         server.DATA["alarms"].clear()
         server.DATA["stats"]["received"] = 0
         server.ACTIVE_DEVICE_CODES_BY_SOURCE = {}
+        server.RULE_ENGINE["rules"] = []
+        server.RULE_ENGINE["state"] = {}
+        server.RULE_ENGINE["loadedAt"] = time.time()
 
     def telemetry(self, code="PLC-001", point="temperature", value=70.0, event="e"):
         server.process_message("factory/F1/telemetry/normalized",
@@ -59,22 +75,46 @@ class ProcessMessageTests(unittest.TestCase):
         self.assertEqual(len(server.DATA["telemetry"]), 1)
 
     def test_alarm_opens_and_resolves(self):
+        install_rule()
         self.telemetry(value=95, event="hot")
         alarm = server.DATA["alarms"][0]
         self.assertEqual(alarm["status"], "ACTIVE")
-        self.assertEqual(alarm["threshold"], server.ALARM_TEMPERATURE_THRESHOLD)
+        self.assertEqual(alarm["threshold"], 90.0)
+        self.assertFalse(alarm["ack"])
 
-        self.telemetry(value=85, event="cool")
+        self.telemetry(value=86, event="still")  # inside the 5-unit hysteresis band
+        self.assertEqual(alarm["status"], "ACTIVE")
+        self.telemetry(value=84, event="cool")   # below threshold - hysteresis
         self.assertEqual(alarm["status"], "RESOLVED")
         self.assertIn("recoveredAt", alarm)
 
-    def test_active_alarm_not_duplicated_or_reopened(self):
+    def test_active_alarm_not_duplicated(self):
+        install_rule()
         self.telemetry(value=95, event="hot1")
-        self.telemetry(value=97, event="hot2")  # worse reading while active
+        self.telemetry(value=97, event="hot2")
         self.telemetry(value=99, event="hot3")
         active = [a for a in server.DATA["alarms"] if a["status"] == "ACTIVE"]
         self.assertEqual(len(active), 1)
-        self.assertEqual(active[0]["value"], 99)
+        self.assertEqual(active[0]["value"], 95)  # first trigger value is kept
+
+    def test_duration_requires_sustained_breach(self):
+        install_rule(duration_sec=10)
+        base = time.time()
+        server.evaluate_rules("D1", "temperature", 95, base)        # breach starts
+        server.evaluate_rules("D1", "temperature", 95, base + 5)    # still within duration
+        self.assertEqual(list(server.DATA["alarms"]), [])
+        server.evaluate_rules("D1", "temperature", 95, base + 10)   # sustained long enough
+        self.assertEqual(len(server.DATA["alarms"]), 1)
+        server.evaluate_rules("D1", "temperature", 84, base + 11)   # recovers
+        self.assertEqual(server.DATA["alarms"][0]["status"], "RESOLVED")
+
+    def test_transient_breach_never_fires(self):
+        install_rule(duration_sec=10)
+        base = time.time()
+        server.evaluate_rules("D1", "temperature", 95, base)
+        server.evaluate_rules("D1", "temperature", 80, base + 5)    # back to normal early
+        server.evaluate_rules("D1", "temperature", 95, base + 20)   # a fresh breach restarts
+        self.assertEqual(list(server.DATA["alarms"]), [])
 
     def test_registry_filters_unknown_devices(self):
         server.process_message("factory/F1/device/registry",
