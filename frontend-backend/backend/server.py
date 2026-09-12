@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json, logging, os, queue, sys, threading, time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -482,6 +482,20 @@ RULE_ENGINE = {"rules": [], "loadedAt": 0.0, "state": {}}
 RULE_RELOAD_SECONDS = 30.0
 OPERATORS = (">", ">=", "<", "<=")
 
+# History retention: rows older than the configured number of days are purged
+# hourly (0 disables). Keeps iot_history_data bounded in long-running demos.
+HISTORY_RETENTION_DAYS = int(os.getenv("IOT_HISTORY_RETENTION_DAYS", "7"))
+RETENTION_SWEEP_SECONDS = 3600.0
+
+
+def retention_loop():
+    while True:
+        if HISTORY_RETENTION_DAYS > 0:
+            cutoff_time = (datetime.now(timezone.utc) - timedelta(days=HISTORY_RETENTION_DAYS)).replace(tzinfo=None)
+            if DB.execute("DELETE FROM iot_history_data WHERE collect_time < %s", (cutoff_time,)):
+                logging.info("history retention sweep done (kept %s days)", HISTORY_RETENTION_DAYS)
+        time.sleep(RETENTION_SWEEP_SECONDS)
+
 
 def load_rules(force=False):
     now = time.time()
@@ -510,13 +524,22 @@ def rule_violated(rule, value):
 
 
 def evaluate_rules(code, point, value, now):
-    """Run every matching rule for one reading; open, sustain and resolve alarms."""
+    """Run the alarm engine for one reading.
+
+    Two phases: first the reading updates the per-rule/device breach state,
+    then a scan over *all* states fires every rule whose duration gate has
+    elapsed. The scan matters because a dead-zone-suppressed device may stop
+    sending frames while still in breach — other devices' frames keep the
+    engine ticking and the pending alarm still fires.
+    """
     load_rules()
+    rules_by_id = {rule["id"]: rule for rule in RULE_ENGINE["rules"]}
     for rule in RULE_ENGINE["rules"]:
         if not rule.get("enabled", True) or not rule_matches(rule, code, point):
             continue
         key = (rule["id"], code)
         state = RULE_ENGINE["state"].setdefault(key, {"since": None, "active": False})
+        state["last_value"] = value
         violated = rule_violated(rule, value)
         if not state["active"]:
             if not violated:
@@ -524,31 +547,52 @@ def evaluate_rules(code, point, value, now):
                 continue
             if state["since"] is None:
                 state["since"] = now
-            if now - state["since"] >= rule["duration_sec"]:
-                state["active"] = True
-                DATA["alarms"].append({"deviceCode": code, "pointCode": point,
-                                       "level": rule["level"], "value": value,
-                                       "threshold": rule["threshold"], "ruleId": rule["id"],
-                                       "status": "ACTIVE", "ack": False, "time": now})
-                DB.alarm_triggered(code, point, value, rule["threshold"], rule["level"])
-                logging.warning("alarm OPEN device=%s point=%s value=%s rule=%s threshold=%s",
-                                code, point, value, rule["id"], rule["threshold"])
+    _fire_due_alarms(now)
+    _resolve_recovered(code, point, value, now)
+
+
+def _fire_due_alarms(now):
+    """Open every alarm whose breach has lasted at least duration_sec."""
+    for (rule_id, code), state in RULE_ENGINE["state"].items():
+        if state["active"] or state["since"] is None:
+            continue
+        rule = next((r for r in RULE_ENGINE["rules"] if r["id"] == rule_id), None)
+        if rule is None or not rule.get("enabled", True):
+            continue
+        if now - state["since"] < rule["duration_sec"]:
+            continue
+        state["active"] = True
+        DATA["alarms"].append({"deviceCode": code, "pointCode": rule["point_code"],
+                               "level": rule["level"], "value": state.get("last_value"),
+                               "threshold": rule["threshold"], "ruleId": rule_id,
+                               "status": "ACTIVE", "ack": False, "time": now})
+        DB.alarm_triggered(code, rule["point_code"], state.get("last_value"), rule["threshold"], rule["level"])
+        logging.warning("alarm OPEN device=%s point=%s value=%s rule=%s threshold=%s",
+                        code, rule["point_code"], state.get("last_value"), rule_id, rule["threshold"])
+
+
+def _resolve_recovered(code, point, value, now):
+    """Resolve active alarms of this device/point once the hysteresis band is crossed."""
+    for rule in RULE_ENGINE["rules"]:
+        if not rule_matches(rule, code, point) or not rule.get("enabled", True):
+            continue
+        state = RULE_ENGINE["state"].get((rule["id"], code))
+        if not state or not state["active"]:
+            continue
+        if rule["operator"] in (">", ">="):
+            recovered = value < rule["threshold"] - rule["hysteresis"]
         else:
-            # Recovery needs to cross the hysteresis band below the threshold.
-            if rule["operator"] in (">", ">="):
-                recovered = value < rule["threshold"] - rule["hysteresis"]
-            else:
-                recovered = value > rule["threshold"] + rule["hysteresis"]
-            if recovered:
-                state["active"] = False
-                state["since"] = None
-                for alarm in DATA["alarms"]:
-                    if (alarm["deviceCode"] == code and alarm["pointCode"] == point
-                            and alarm.get("ruleId") == rule["id"] and alarm["status"] == "ACTIVE"):
-                        alarm["status"] = "RESOLVED"
-                        alarm["recoveredAt"] = now
-                DB.alarm_resolved(code, point)
-                logging.info("alarm RESOLVED device=%s point=%s value=%s", code, point, value)
+            recovered = value > rule["threshold"] + rule["hysteresis"]
+        if recovered:
+            state["active"] = False
+            state["since"] = None
+            for alarm in DATA["alarms"]:
+                if (alarm["deviceCode"] == code and alarm["pointCode"] == point
+                        and alarm.get("ruleId") == rule["id"] and alarm["status"] == "ACTIVE"):
+                    alarm["status"] = "RESOLVED"
+                    alarm["recoveredAt"] = now
+            DB.alarm_resolved(code, point)
+            logging.info("alarm RESOLVED device=%s point=%s value=%s", code, point, value)
 
 
 def process_message(topic, payload):
@@ -789,6 +833,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(DB.point_configs() or [])
             if path == "/api/alarm-rules":
                 return self.send_json(DB.alarm_rules() or [])
+            if path == "/api/debug/engine":
+                return self.send_json({
+                    "rules": RULE_ENGINE["rules"],
+                    "loadedAt": RULE_ENGINE["loadedAt"],
+                    "state": {f"{k[0]}/{k[1]}": v for k, v in RULE_ENGINE["state"].items()},
+                    "registrySources": {s: sorted(c) for s, c in ACTIVE_DEVICE_CODES_BY_SOURCE.items()},
+                })
         return self.send_json({"error": "not found"}, 404)
 
     def stream_events(self):
@@ -901,5 +952,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=consume, daemon=True).start()
+    threading.Thread(target=retention_loop, daemon=True).start()
     print("[backend] http://127.0.0.1:8080", flush=True)
     ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()

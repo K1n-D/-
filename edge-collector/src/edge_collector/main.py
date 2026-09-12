@@ -9,19 +9,95 @@ Run:  python -m edge_collector.main --config edge-collector/configs/point-table.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "middleware" / "src"))
 
 from edge_collector.collector import CollectorDevice
 from edge_collector.point_table import GatewayConfig, PointConfig, load_point_table
+from edge_collector.registers import CODE_TO_SCENARIO, FX_HOLDING, SCENARIO_REGISTER
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+CONTROL_PORT_DEFAULT = 8093
+
+
+def make_control_server(collector: CollectorDevice, host: str, control_port: int):
+    """HTTP control endpoint for the collector.
+
+    POST /api/scenario {"scenario": "..."}  -> write the scenario register to
+    the PLC over a short-lived Modbus connection (the collection thread keeps
+    its own connection; Modbus TCP serves them independently).
+    GET  /api/scenario                      -> current scenario register value
+    GET  /health                            -> liveness
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class ControlHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+
+        def _json(self, payload, status=200):
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _modbus_session(self):
+            from pymodbus.client import ModbusTcpClient
+            client = ModbusTcpClient(collector.gateway.host, port=collector.gateway.port, timeout=3)
+            connected = client.connect()
+            return client, connected
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/health":
+                return self._json({"status": "UP", "gateway": collector.gateway.id,
+                                   "devices": collector.device_codes})
+            if path == "/api/scenario":
+                client, connected = self._modbus_session()
+                if not connected:
+                    client.close()
+                    return self._json({"error": "PLC unreachable"}, 503)
+                try:
+                    raw = client.read_holding_registers(SCENARIO_REGISTER, count=1, slave=1).registers[0]
+                finally:
+                    client.close()
+                return self._json({"scenario": CODE_TO_SCENARIO.get(raw, "unknown"), "raw": raw})
+            return self._json({"error": "not found"}, 404)
+
+        def do_POST(self):
+            if urlparse(self.path).path != "/api/scenario":
+                return self._json({"error": "not found"}, 404)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                scenario = str(body.get("scenario", ""))
+                from edge_collector.registers import SCENARIO_CODES
+                raw = SCENARIO_CODES[scenario]
+            except (ValueError, json.JSONDecodeError, KeyError):
+                return self._json({"error": "scenario must be one of normal/high-temperature/low-pressure"}, 400)
+            client, connected = self._modbus_session()
+            if not connected:
+                client.close()
+                return self._json({"error": "PLC unreachable"}, 503)
+            try:
+                client.write_register(SCENARIO_REGISTER, raw, slave=1)
+            finally:
+                client.close()
+            logging.info("scenario register written: %s (HR15=%s)", scenario, raw)
+            return self._json({"ok": True, "scenario": scenario})
+
+    return ThreadingHTTPServer((host, control_port), ControlHandler)
 
 
 def load_points_from_db():
@@ -65,6 +141,8 @@ def main():
     parser.add_argument("--config", default=None, help="fallback point-table YAML file")
     parser.add_argument("--slave-host", default=None, help="Modbus slave host (default: YAML or 127.0.0.1)")
     parser.add_argument("--slave-port", type=int, default=None, help="Modbus slave port (default: YAML or 1502)")
+    parser.add_argument("--control-port", type=int, default=CONTROL_PORT_DEFAULT,
+                        help="HTTP control endpoint port (0 disables)")
     parser.add_argument("--mqtt-host", default=os.getenv("IOT_MQTT_HOST", "127.0.0.1"))
     parser.add_argument("--mqtt-port", type=int, default=int(os.getenv("IOT_MQTT_PORT", "1883")))
     args = parser.parse_args()
@@ -93,6 +171,11 @@ def main():
     collector = CollectorDevice(gateway, mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port)
     print(f"[edge-collector] gateway={gateway.id} source={source} points={len(gateway.points)} "
           f"devices={collector.device_codes} modbus={gateway.host}:{gateway.port}", flush=True)
+    if args.control_port:
+        import threading
+        control = make_control_server(collector, "127.0.0.1", args.control_port)
+        threading.Thread(target=control.serve_forever, name="collector-control", daemon=True).start()
+        print(f"[edge-collector] control API http://127.0.0.1:{args.control_port}/api/scenario", flush=True)
     try:
         collector.run()
     except KeyboardInterrupt:

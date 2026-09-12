@@ -17,31 +17,40 @@ from pymodbus.datastore import ModbusSequentialDataBlock, ModbusServerContext, M
 from pymodbus.server import StartAsyncTcpServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from edge_collector.registers import FX_HOLDING, REGISTER_COUNT, RegisterImage, register_writer
+from edge_collector.registers import CODE_TO_SCENARIO, FX_HOLDING, REGISTER_COUNT, RegisterImage, SCENARIO_REGISTER, register_writer
 
 
 def build_context(image: RegisterImage):
     """Seed the slave's holding registers from the current process image.
 
-    Returns ``(context, store)``. All four blocks are passed explicitly:
-    pymodbus 3.9.2's ModbusSlaveContext decides ``co/ir/hr`` based on
-    ``di is not None`` alone, so a lone ``hr=`` would silently be replaced
-    by an empty block.
+    Returns ``(context, store)``. Seeding must go through ``store.setValues``
+    (not by pre-filling the block): pymodbus 3.9.2 shifts every context access
+    by +1, so a pre-filled block is misaligned by one register, and all four
+    blocks must still be passed explicitly because the context decides
+    ``co/ir/hr`` based on ``di is not None`` alone.
     """
-    initial = image.encode()
-    registers = initial + [0] * (REGISTER_COUNT - len(initial))
+    registers = image.encode()
     store = ModbusSlaveContext(
         di=ModbusSequentialDataBlock(0, [0] * REGISTER_COUNT),
         co=ModbusSequentialDataBlock(0, [0] * REGISTER_COUNT),
         ir=ModbusSequentialDataBlock(0, [0] * REGISTER_COUNT),
-        hr=ModbusSequentialDataBlock(0, registers),
+        hr=ModbusSequentialDataBlock(0, [0] * REGISTER_COUNT),
     )
+    store.setValues(FX_HOLDING, 0, registers)
     return ModbusServerContext(slaves={1: store}, single=False), store
 
 
 async def refresh_registers(store: ModbusSlaveContext, image: RegisterImage, interval=1.0):
-    """Push the process image into the slave's register block each tick."""
+    """Push the process image into the slave's register block each tick.
+
+    Before writing, the scenario register (HR15) is read back: an operator
+    (here the collector's control endpoint) changes the process behaviour by
+    writing that register, exactly like setting a setpoint on a real PLC.
+    """
     while True:
+        raw_list = store.getValues(FX_HOLDING, SCENARIO_REGISTER, 1)
+        if raw_list:
+            image.set_scenario(CODE_TO_SCENARIO.get(raw_list[0], "normal"))
         image.update()
         store.setValues(FX_HOLDING, 0, image.encode())
         await asyncio.sleep(interval)

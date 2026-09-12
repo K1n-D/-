@@ -117,6 +117,20 @@ class ProcessMessageTests(unittest.TestCase):
         server.evaluate_rules("D1", "temperature", 95, base + 20)   # a fresh breach restarts
         self.assertEqual(list(server.DATA["alarms"]), [])
 
+    def test_sustained_breach_fires_from_other_devices_frames(self):
+        # A dead-zone-suppressed device stops sending frames while still in
+        # breach; other devices' frames must keep the engine ticking so the
+        # pending alarm still fires after duration_sec.
+        install_rule(duration_sec=10)
+        base = time.time()
+        server.evaluate_rules("MODBUS-1", "temperature", 95, base)  # single breach frame
+        for offset in (2, 4, 6, 8, 10, 12):
+            server.evaluate_rules("OTHER", "temperature", 60, base + offset)
+        active = [a for a in server.DATA["alarms"]
+                  if a["deviceCode"] == "MODBUS-1" and a["status"] == "ACTIVE"]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["value"], 95)
+
     def test_registry_filters_unknown_devices(self):
         server.process_message("factory/F1/device/registry",
                                {"source": "mqtt-simulator", "deviceCodes": ["PLC-001"]})

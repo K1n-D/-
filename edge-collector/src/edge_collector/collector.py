@@ -24,6 +24,10 @@ FACTORY = "FACTORY-001"
 REGISTRY_TOPIC = f"factory/{FACTORY}/device/registry"
 REGISTRY_INTERVAL_SEC = 5.0
 FAILS_BEFORE_OFFLINE = 3
+# Dead-zone suppression must never fully silence a point: even a constant
+# value is re-reported periodically so downstream consumers (and the alarm
+# engine's duration gate) keep seeing the current state.
+FORCED_REPORT_SEC = 30.0
 
 
 def engineering_value(raw, scale_factor):
@@ -158,8 +162,9 @@ class CollectorDevice:
             value = engineering_value(raw, point.scale_factor)
             key = (point.device_code, point.point_code)
             last = self._last_values.get(key)
-            if should_report(value, last, point.dead_zone) and \
-                    now - self._last_report.get(key, 0) >= point.collect_interval_ms / 1000:
+            now_since_report = now - self._last_report.get(key, 0)
+            if (should_report(value, last, point.dead_zone) or now_since_report >= FORCED_REPORT_SEC) \
+                    and now_since_report >= point.collect_interval_ms / 1000:
                 self.publish_telemetry(point, value)
                 self._last_values[key] = value
                 self._last_report[key] = now
