@@ -64,11 +64,15 @@ class CollectorEndToEnd(unittest.TestCase):
         self.port = free_port()
         self.image = RegisterImage(scenario="normal")
         env = dict(os.environ, PYTHONPATH=f"{ROOT / 'edge-collector' / 'src'}{os.pathsep}{ROOT / 'middleware' / 'src'}")
+        # --freeze keeps the slave's registers at their initial values, so the
+        # expected engineering value (65.0) is deterministic regardless of
+        # runner speed; the register-writer cadence is exercised by the slave
+        # running in the full stack, not here.
         self.slave = subprocess.Popen(
             [sys.executable, "-u", "-X", "utf8", "-m", "edge_collector.slave",
-             "--port", str(self.port), "--tick", "0.5"],
+             "--port", str(self.port), "--freeze"],
             cwd=str(ROOT), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.time() + 10
+        deadline = time.time() + 20
         while time.time() < deadline:
             if self._reachable():
                 return

@@ -51,7 +51,8 @@ async def main_async(args):
     image = RegisterImage(scenario=args.scenario)
     context, store = build_context(image)
     print(f"[modbus-slave] device_id=1 listening on {args.host}:{args.port} scenario={image.scenario}", flush=True)
-    asyncio.create_task(refresh_registers(store, image, args.tick))
+    if not args.freeze:
+        asyncio.create_task(refresh_registers(store, image, args.tick))
     await StartAsyncTcpServer(context, address=(args.host, args.port))
 
 
@@ -61,6 +62,8 @@ def main():
     parser.add_argument("--port", type=int, default=1502)
     parser.add_argument("--scenario", default="normal")
     parser.add_argument("--tick", type=float, default=1.0, help="register update interval, seconds")
+    parser.add_argument("--freeze", action="store_true",
+                        help="keep registers at their initial values (used by tests)")
     args = parser.parse_args()
     try:
         asyncio.run(main_async(args))
