@@ -105,6 +105,7 @@ class Broker:
         server.listen(50)
         server.settimeout(1)
         print(f"[broker] MQTT 3.1.1 listening on {self.host}:{self.port}", flush=True)
+        threading.Thread(target=self._keepalive_watchdog, daemon=True).start()
         try:
             while True:
                 try:
@@ -114,6 +115,24 @@ class Broker:
                 threading.Thread(target=self._client, args=(conn,), daemon=True).start()
         finally:
             server.close()
+
+    def _keepalive_watchdog(self):
+        """Disconnect clients that miss their keepalive deadline.
+
+        Without this, a half-open connection stays in self.clients forever:
+        it is only noticed when the next publish to that client fails.
+        """
+        while True:
+            time.sleep(1)
+            now = time.time()
+            with self.lock:
+                stale = [client for client in self.clients.values()
+                         if client["keepalive"] and now - client.get("last_seen", now) > client["keepalive"] * 1.5 + 1]
+            for client in stale:
+                try:
+                    client["socket"].shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     @staticmethod
     def _send(item: dict, packet: bytes):
@@ -142,6 +161,7 @@ class Broker:
                 self.clients[client_id] = item
             self._send(item, _packet(0x20, b"\x00\x00"))
             while not item["closed"]:
+                item["last_seen"] = time.time()
                 first, payload = _read_packet(conn)
                 packet_type, flags = first >> 4, first & 0x0F
                 if packet_type == 8:  # SUBSCRIBE
@@ -166,7 +186,10 @@ class Broker:
                 with self.lock:
                     if self.clients.get(item["clientId"]) is item:
                         self.clients.pop(item["clientId"], None)
-                if item.get("will") and not clean_disconnect and not item.get("closed"):
+                # Only a received DISCONNECT suppresses the will.  A failed
+                # send sets item["closed"] as well, and that is exactly the
+                # abnormal-disconnect case where the will must still fire.
+                if item.get("will") and not clean_disconnect:
                     will = item["will"]
                     self.publish(will["topic"], will["payload"], qos=1, retain=will["retain"])
             try:
@@ -254,11 +277,12 @@ class Client:
         self._reader = None
         self._send_lock = threading.Lock()
         self._packet_id = 0
+        self._inflight: dict[int, tuple[bytes, float]] = {}  # packet_id -> (packet, sent_time)
 
     def connect(self, timeout=5):
         self.sock = socket.create_connection((self.host, self.port), timeout)
         self.sock.settimeout(None)
-        flags = 0x02  # clean session false
+        flags = 0x02  # clean session = true (the bundled broker keeps no session state)
         if self.will:
             flags |= 0x04 | (0x08 if self.will.get("qos", 1) == 1 else 0) | (0x20 if self.will.get("retain", True) else 0)
         body = _utf("MQTT") + bytes([4, flags]) + int(self.keepalive).to_bytes(2, "big") + _utf(self.client_id)
@@ -271,6 +295,7 @@ class Client:
         self.running = True
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
+        threading.Thread(target=self._resend_loop, daemon=True).start()
         if self.on_state:
             self.on_state("CONNECTED")
 
@@ -293,18 +318,53 @@ class Client:
 
     def publish(self, topic, payload, qos=1, retain=False):
         body = _utf(topic)
+        packet_id = None
         if qos:
-            body += self._next_packet_id().to_bytes(2, "big")
+            packet_id = self._next_packet_id()
+            body += packet_id.to_bytes(2, "big")
         body += json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self._send(_packet(0x30 | ((min(qos, 1) & 3) << 1) | int(retain), body))
+        packet = _packet(0x30 | ((min(qos, 1) & 3) << 1) | int(retain), body)
+        if qos and packet_id is not None:
+            self._inflight[packet_id] = (packet, time.time())
+        self._send(packet)
+
+    def _resend_loop(self, interval=2.0, timeout=5.0):
+        """Redeliver unacknowledged QoS 1 publishes with the DUP flag set.
+
+        This upgrades the client side to real at-least-once semantics for the
+        publish leg; deduplication downstream stays the subscriber's job.
+        """
+        while self.running:
+            time.sleep(interval)
+            now = time.time()
+            for packet_id, (packet, sent) in list(self._inflight.items()):
+                if now - sent < timeout:
+                    continue
+                dup_packet = bytes([packet[0] | 0x08]) + packet[1:]
+                self._inflight[packet_id] = (dup_packet, now)
+                self._send(dup_packet)
 
     def _read(self):
         try:
             while self.running and self.sock:
-                first, payload = _read_packet(self.sock)
-                packet_type = first >> 4
+                # Poll with a timeout instead of blocking forever so a clean
+                # disconnect() can stop this thread before the socket closes;
+                # closing a socket with a recv() pending is an abortive close
+                # on Windows and would swallow the outbound DISCONNECT packet.
+                try:
+                    self.sock.settimeout(0.5)
+                    first = self.sock.recv(1)
+                except socket.timeout:
+                    continue
+                except (ConnectionError, OSError):
+                    raise
+                if not first:
+                    raise ConnectionError("socket closed while reading packet")
+                self.sock.settimeout(None)
+                packet_type = first[0] >> 4
+                payload = _read_exact(self.sock, _read_remaining(self.sock))
                 if packet_type == 3:
-                    qos = (first >> 1) & 0x03
+                    qos = (first[0] >> 1) & 0x03
                     topic, index = _take_utf(payload, 0)
                     packet_id = None
                     if qos:
@@ -316,8 +376,13 @@ class Client:
                         self._send(_packet(0x40, packet_id.to_bytes(2, "big")))
                 elif packet_type == 13 and self.on_control:
                     self.on_control("PINGRESP")
+                elif packet_type == 4:  # PUBACK: our QoS 1 publish was acknowledged
+                    if len(payload) >= 2:
+                        self._inflight.pop(int.from_bytes(payload[:2], "big"), None)
+                    if self.on_control:
+                        self.on_control("PUBACK")
                 elif self.on_control:
-                    self.on_control({1: "CONNACK", 9: "SUBACK", 4: "PUBACK"}.get(packet_type, str(packet_type)))
+                    self.on_control({1: "CONNACK", 9: "SUBACK"}.get(packet_type, str(packet_type)))
         except (ConnectionError, OSError, ValueError, UnicodeError):
             pass
         self._closed()
@@ -334,6 +399,7 @@ class Client:
         if not self.running:
             return
         self.running = False
+        self._inflight.clear()
         try:
             if self.sock:
                 self.sock.close()
@@ -343,6 +409,21 @@ class Client:
             self.on_state("DISCONNECTED")
 
     def disconnect(self):
-        if self.running:
-            self._send(_packet(0xE0))
-        self._closed()
+        if not self.running:
+            return
+        self._send(_packet(0xE0))
+        if not self.running:  # the send failed; _closed() already cleaned up
+            return
+        # Stop the reader before closing the socket so the DISCONNECT packet
+        # is actually delivered (see the note in _read about abortive closes).
+        self.running = False
+        reader = self._reader
+        if reader and reader is not threading.current_thread() and reader.is_alive():
+            reader.join(timeout=2)
+        try:
+            if self.sock:
+                self.sock.close()
+        except OSError:
+            pass
+        if self.on_state:
+            self.on_state("DISCONNECTED")

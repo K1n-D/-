@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import random
 import sys
 import threading
@@ -198,6 +199,7 @@ class DeviceManager:
         self.devices = {}
         self.threads = {}
         self.lock = threading.RLock()
+        self._registry_client = None
         default_path = Path(__file__).resolve().parents[2] / "configs" / "runtime-devices.json"
         self.state_path = Path(state_path or default_path)
 
@@ -221,20 +223,28 @@ class DeviceManager:
         temp_path.replace(self.state_path)
 
     def _publish_registry_locked(self):
-        """Publish the authoritative simulator inventory as a retained MQTT message."""
+        """Publish the authoritative simulator inventory as a retained MQTT message.
+
+        Uses one long-lived control connection (reconnected on demand) instead
+        of opening a fresh TCP connection for every inventory change and for
+        the periodic refresh loop.
+        """
+        client = self._registry_client
+        if client is None or not client.running:
+            try:
+                client = Client(f"simulator-registry-{os.getpid()}", keepalive=10)
+                client.connect()
+                client.start_keepalive()
+            except OSError:
+                self._registry_client = None
+                return
+            self._registry_client = client
         try:
-            client = Client("simulator-registry", keepalive=10)
-            client.connect()
-            client.publish(
-                "factory/FACTORY-001/simulator/registry",
-                {"deviceCodes": sorted(self.devices), "updatedAt": utc_now()},
-                qos=1,
-                retain=True,
-            )
-            time.sleep(.05)
-            client.disconnect()
+            client.publish("factory/FACTORY-001/simulator/registry",
+                           {"deviceCodes": sorted(self.devices), "updatedAt": utc_now()},
+                           qos=1, retain=True)
         except OSError:
-            pass
+            self._registry_client = None
 
     def load_or_seed(self, scenario="normal"):
         with self.lock:
