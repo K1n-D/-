@@ -37,7 +37,7 @@ class ProcessMessageTests(unittest.TestCase):
         server.DATA["telemetry"].clear()
         server.DATA["alarms"].clear()
         server.DATA["stats"]["received"] = 0
-        server.ACTIVE_SIMULATOR_CODES = None
+        server.ACTIVE_DEVICE_CODES_BY_SOURCE = {}
 
     def telemetry(self, code="PLC-001", point="temperature", value=70.0, event="e"):
         server.process_message("factory/F1/telemetry/normalized",
@@ -77,7 +77,8 @@ class ProcessMessageTests(unittest.TestCase):
         self.assertEqual(active[0]["value"], 99)
 
     def test_registry_filters_unknown_devices(self):
-        server.process_message("factory/F1/simulator/registry", {"deviceCodes": ["PLC-001"]})
+        server.process_message("factory/F1/device/registry",
+                               {"source": "mqtt-simulator", "deviceCodes": ["PLC-001"]})
         self.telemetry(code="INTRUDER-9", event="x1")
         self.assertEqual(server.DATA["stats"]["received"], 0)
         self.assertNotIn("INTRUDER-9", server.DATA["devices"])
@@ -85,13 +86,42 @@ class ProcessMessageTests(unittest.TestCase):
         self.telemetry(code="PLC-001", event="x2")
         self.assertEqual(server.DATA["stats"]["received"], 1)
 
+    def test_multi_source_registry_union(self):
+        # A first-arriving source must not prune devices owned by sources
+        # whose registry has not landed yet; once both sources are known the
+        # union governs acceptance and pruning.
+        server.process_message("factory/F1/device/registry",
+                               {"source": "mqtt-simulator", "deviceCodes": ["SIM-1"]})
+        server.process_message("factory/F1/device/registry",
+                               {"source": "modbus-gateway", "deviceCodes": ["MODBUS-1"]})
+        self.telemetry(code="MODBUS-1", event="m1")
+        self.assertEqual(server.DATA["stats"]["received"], 1)
+        self.assertIn("SIM-1", server.DATA["devices"])
+
+        # The gateway re-announces with its device gone: MODBUS-1 is pruned
+        # against the union, SIM-1 survives.
+        server.process_message("factory/F1/device/registry",
+                               {"source": "modbus-gateway", "deviceCodes": []})
+        self.assertNotIn("MODBUS-1", server.DATA["devices"])
+        self.assertIn("SIM-1", server.DATA["devices"])
+        self.telemetry(code="MODBUS-1", event="m2")
+        self.assertEqual(server.DATA["stats"]["received"], 1)
+
+    def test_registry_prunes_removed_devices(self):
+        server.process_message("factory/F1/device/registry",
+                               {"source": "modbus-gateway", "deviceCodes": ["MODBUS-1"]})
+        server.process_message("factory/F1/device/registry",
+                               {"source": "modbus-gateway", "deviceCodes": []})
+        self.assertNotIn("MODBUS-1", server.DATA["devices"])
+
     def test_removed_status_deletes_device(self):
-        server.process_message("factory/F1/simulator/registry", {"deviceCodes": ["PLC-001"]})
+        server.process_message("factory/F1/device/registry",
+                               {"source": "mqtt-simulator", "deviceCodes": ["PLC-001"]})
         self.telemetry(code="PLC-001", event="seed")
         server.process_message("factory/F1/device/PLC-001/status",
                                {"deviceCode": "PLC-001", "status": "OFFLINE", "reason": "REMOVED"})
         self.assertNotIn("PLC-001", server.DATA["devices"])
-        self.assertNotIn("PLC-001", server.ACTIVE_SIMULATOR_CODES)
+        self.assertNotIn("PLC-001", server.ACTIVE_DEVICE_CODES_BY_SOURCE["mqtt-simulator"])
 
 
 if __name__ == "__main__":

@@ -243,18 +243,26 @@ DATA = {"devices": {}, "telemetry": deque(maxlen=500), "alarms": deque(maxlen=MA
         "stats": {"received": 0}, "startedAt": time.time()}
 LOCK = threading.RLock()
 
-# The simulator publishes an authoritative retained inventory.  MQTT status
-# messages are also retained, so a broker can replay an old OFFLINE status
-# for a device that has since been deleted.  Keep the latest registry in
-# memory and reject those stale messages after the registry has been seen.
-# ``None`` means the backend has not received a registry yet (for example when
-# it is connected before the simulator starts); in that short window normal
-# MQTT messages are still accepted so real devices are not blocked.
-ACTIVE_SIMULATOR_CODES = None
+# Devices register themselves through retained registry messages published on
+# factory/FACTORY-001/device/registry.  Every access path (the MQTT-direct
+# simulator, a Modbus edge collector, later a real gateway) announces its
+# devices with a distinct "source", so the backend accepts telemetry exactly
+# for the union of registered devices and rejects stale retained statuses of
+# devices that were deleted meanwhile.
+# ``{}`` means no registry has been received yet; in that window messages from
+# unknown devices are still accepted so a restarted backend is not blocked.
+ACTIVE_DEVICE_CODES_BY_SOURCE: dict = {}
 
 
-def load_persisted_simulator_registry():
-    """Use the simulator's durable inventory before MQTT retained delivery.
+def all_active_device_codes():
+    codes = set()
+    for source_codes in ACTIVE_DEVICE_CODES_BY_SOURCE.values():
+        codes |= source_codes
+    return codes
+
+
+def load_persisted_registry():
+    """Seed the simulator's durable inventory before MQTT retained delivery.
 
     The lightweight local broker keeps retained messages in memory only.  If
     the broker is restarted while the simulator is still running, its
@@ -262,7 +270,6 @@ def load_persisted_simulator_registry():
     runtime-devices.json file prevents stale retained status messages from
     repopulating deleted devices during that interval.
     """
-    global ACTIVE_SIMULATOR_CODES
     state_path = ROOT / "simulated-devices" / "configs" / "runtime-devices.json"
     try:
         records = json.loads(state_path.read_text(encoding="utf-8"))
@@ -270,11 +277,10 @@ def load_persisted_simulator_registry():
                  if isinstance(item, dict) and item.get("deviceCode")}
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return
-    if not codes:
-        return
-    ACTIVE_SIMULATOR_CODES = codes
-    for code in codes:
-        DATA["devices"].setdefault(code, {"deviceCode": code, "status": "OFFLINE", "points": {}})
+    if codes:
+        ACTIVE_DEVICE_CODES_BY_SOURCE["mqtt-simulator"] = codes
+        for code in codes:
+            DATA["devices"].setdefault(code, {"deviceCode": code, "status": "OFFLINE", "points": {}})
 
 
 def evaluate_temperature_alarm(code, value):
@@ -305,17 +311,24 @@ def process_message(topic, payload):
     Raises on malformed input so tests can assert the failure; consume() wraps
     this in a catch-all so a single bad message can never kill the reader.
     """
-    global ACTIVE_SIMULATOR_CODES
+    global ACTIVE_DEVICE_CODES_BY_SOURCE
     if not isinstance(payload, dict):
         raise ValueError("payload must be a JSON object")
     with LOCK:
-        if topic.endswith("/simulator/registry"):
+        if topic.endswith("/device/registry"):
+            source = str(payload.get("source", "unknown"))
             active = set(payload.get("deviceCodes", [])) if isinstance(payload.get("deviceCodes"), list) else set()
-            ACTIVE_SIMULATOR_CODES = active
-            for code in list(DATA["devices"]):
-                if code not in active:
-                    DATA["devices"].pop(code, None)
-                    DB.execute("DELETE FROM iot_device WHERE device_code=%s", (code,))
+            is_known_source = source in ACTIVE_DEVICE_CODES_BY_SOURCE
+            ACTIVE_DEVICE_CODES_BY_SOURCE[source] = active
+            if is_known_source:
+                # Only prune against the union once every registry source has
+                # been seen: pruning on the first arriving source would wipe
+                # devices owned by sources whose registry has not landed yet.
+                active_all = all_active_device_codes()
+                for code in list(DATA["devices"]):
+                    if code not in active_all:
+                        DATA["devices"].pop(code, None)
+                        DB.execute("DELETE FROM iot_device WHERE device_code=%s", (code,))
             for code in active:
                 DATA["devices"].setdefault(code, {"deviceCode": code, "status": "OFFLINE", "points": {}})
             return
@@ -323,8 +336,9 @@ def process_message(topic, payload):
             code = payload.get("deviceCode")
             if not code:
                 raise ValueError("telemetry payload requires deviceCode")
-            if ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
-                logging.info("ignore telemetry for device outside simulator registry: %s", code)
+            active_all = all_active_device_codes()
+            if active_all and code not in active_all:
+                logging.info("ignore telemetry for device outside registry: %s", code)
                 return
             DATA["stats"]["received"] += 1
             DATA["telemetry"].append(payload)
@@ -341,8 +355,9 @@ def process_message(topic, payload):
             code = payload.get("deviceCode")
             if not code:
                 raise ValueError("heartbeat payload requires deviceCode")
-            if ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
-                logging.info("ignore heartbeat for device outside simulator registry: %s", code)
+            active_all = all_active_device_codes()
+            if active_all and code not in active_all:
+                logging.info("ignore heartbeat for device outside registry: %s", code)
                 return
             DATA["devices"].setdefault(code, {"deviceCode": code})["lastHeartbeat"] = payload.get("receivedTime")
             DB.heartbeat(payload)
@@ -351,17 +366,18 @@ def process_message(topic, payload):
             code = payload["deviceCode"]
             # REMOVED is an explicit deletion event and must always be
             # honoured.  Other retained status messages from a deleted
-            # simulator are ignored once the authoritative registry is
+            # device are ignored once the authoritative registry is
             # available, preventing stale devices from reappearing.
-            if payload.get("reason") != "REMOVED" and ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
-                logging.info("ignore status for device outside simulator registry: %s", code)
+            active_all = all_active_device_codes()
+            if payload.get("reason") != "REMOVED" and active_all and code not in active_all:
+                logging.info("ignore status for device outside registry: %s", code)
                 return
             device = DATA["devices"].setdefault(code, {"deviceCode": code})
             old_status = device.get("status")
             if payload.get("reason") == "REMOVED":
                 DATA["devices"].pop(code, None)
-                if ACTIVE_SIMULATOR_CODES is not None:
-                    ACTIVE_SIMULATOR_CODES.discard(code)
+                for source_codes in ACTIVE_DEVICE_CODES_BY_SOURCE.values():
+                    source_codes.discard(code)
                 DB.execute("DELETE FROM iot_device WHERE device_code=%s", (code,))
                 DB.status(payload, old_status)
                 return
@@ -372,7 +388,7 @@ def process_message(topic, payload):
 
 
 def consume():
-    load_persisted_simulator_registry()
+    load_persisted_registry()
 
     def msg(topic, payload):
         try:
@@ -389,7 +405,7 @@ def consume():
             c.connect()
             c.start_keepalive()
             for topic in ["factory/+/telemetry/normalized", "factory/+/device/+/heartbeat",
-                          "factory/+/device/+/status", "factory/+/simulator/registry"]:
+                          "factory/+/device/+/status", "factory/+/device/registry"]:
                 c.subscribe(topic)
             while c.running:
                 time.sleep(1)

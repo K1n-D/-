@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$env:PYTHONPATH = "$root\middleware\src;$root\simulated-devices\src"
+# Append, never overwrite: start-all.ps1 may already include edge-collector\src.
+$env:PYTHONPATH = "$root\middleware\src;$root\simulated-devices\src;$root\edge-collector\src;$env:PYTHONPATH"
 New-Item -ItemType Directory -Force -Path "$root\logs" | Out-Null
 $existing = Get-NetTCPConnection -LocalPort 1883 -State Listen -ErrorAction SilentlyContinue
 if ($existing) { Write-Host "MQTT Broker is already listening on 127.0.0.1:1883 (PID $($existing[0].OwningProcess))"; exit 0 }

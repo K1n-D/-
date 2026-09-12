@@ -2,7 +2,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 $root = Split-Path -Parent $PSScriptRoot
 $currentPid = $PID
 $pidDir = Join-Path $root 'work\pids'
-$pattern = 'iot_middleware\.broker|iot_middleware\.main|sim_devices\.main|http\.server.*(5173|5174)|server\.py|vite.*5173|npm.*run.*dev'
+$pattern = 'iot_middleware\.broker|iot_middleware\.main|sim_devices\.main|edge_collector\.main|edge_collector\.slave|http\.server.*(5173|5174)|server\.py|vite.*5173|npm.*run.*dev'
 
 # 1) Stop exactly the processes start-all.ps1 recorded, so a generic command
 #    line such as "server.py" can never match an unrelated python process.

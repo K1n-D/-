@@ -1,0 +1,2 @@
+pymodbus>=3.9,<4
+pyyaml>=6

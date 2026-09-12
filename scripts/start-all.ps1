@@ -1,5 +1,5 @@
 $root = Split-Path -Parent $PSScriptRoot
-$env:PYTHONPATH = "$root\middleware\src;$root\simulated-devices\src"
+$env:PYTHONPATH = "$root\middleware\src;$root\simulated-devices\src;$root\edge-collector\src"
 New-Item -ItemType Directory -Force -Path "$root\logs" | Out-Null
 New-Item -ItemType Directory -Force -Path "$root\work\pids" | Out-Null
 & "$PSScriptRoot\start-mysql.ps1"
@@ -43,6 +43,24 @@ if (-not (Test-RunningCommand 'sim_devices\.main')) {
 }
 else {
   Write-Host 'Simulated devices are already running.'
+}
+
+# Modbus access path: a simulated metering PLC plus the edge collector that
+# polls it per the point table and publishes MQTT telemetry.
+if (-not (Test-ListeningPort 1502)) {
+  $p = Start-Process python -ArgumentList '-u','-m','edge_collector.slave','--port','1502','--scenario','normal' -WorkingDirectory "$root" -RedirectStandardOutput "$root\logs\modbus-slave.log" -RedirectStandardError "$root\logs\modbus-slave-error.log" -WindowStyle Minimized -PassThru
+  Save-Pid 'modbus-slave' $p
+}
+else {
+  Write-Host 'Modbus slave simulator is already listening on 127.0.0.1:1502.'
+}
+Start-Sleep -Milliseconds 500
+if (-not (Test-RunningCommand 'edge_collector\.main')) {
+  $p = Start-Process python -ArgumentList '-u','-m','edge_collector.main','--config','edge-collector/configs/point-table.yml' -WorkingDirectory "$root" -RedirectStandardOutput "$root\logs\edge-collector.log" -RedirectStandardError "$root\logs\edge-collector-error.log" -WindowStyle Minimized -PassThru
+  Save-Pid 'edge-collector' $p
+}
+else {
+  Write-Host 'Edge collector is already running.'
 }
 
 if (Test-Path "$root\frontend-backend\frontend\node_modules\.bin\vite.cmd") {

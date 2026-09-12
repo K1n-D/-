@@ -240,8 +240,9 @@ class DeviceManager:
                 return
             self._registry_client = client
         try:
-            client.publish("factory/FACTORY-001/simulator/registry",
-                           {"deviceCodes": sorted(self.devices), "updatedAt": utc_now()},
+            client.publish("factory/FACTORY-001/device/registry",
+                           {"source": "mqtt-simulator", "deviceCodes": sorted(self.devices),
+                            "updatedAt": utc_now()},
                            qos=1, retain=True)
         except OSError:
             self._registry_client = None

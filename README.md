@@ -4,9 +4,12 @@
 
 - `frontend-backend`：本地 Python 业务 API 和静态 Web 监控页面；接口边界与规划中的 Spring Boot/Vue 版本一致。
 - `middleware`：本地 MQTT 主题总线、协议层 PINGREQ/PINGRESP、业务心跳监测、标准化和指数退避重连。
-- `simulated-devices`：PLC/传感器数据、业务心跳、遗嘱消息和异常场景模拟。
+- `simulated-devices`：PLC/传感器数据、业务心跳、遗嘱消息和异常场景模拟（MQTT 直连接入方式）。
+- `edge-collector`：Modbus TCP 边缘采集器，按点位表轮询 PLC/仪表并转换为 MQTT 遥测（真实工业接入方式），附带 Modbus 从站模拟器。
 
-模拟设备还提供独立控制 API（`127.0.0.1:8091`），可在 Web 监控台的“虚拟设备”页面中动态添加、编辑、启停和删除设备；变更会经 MQTT 同步到中间件和设备状态页面。
+模拟设备还提供独立控制 API（`127.0.0.1:8091`），可在 Web 监控台的"虚拟设备"页面中动态添加、编辑、启停和删除设备；变更会经 MQTT 同步到中间件和设备状态页面。
+
+Modbus 接入路径：`Modbus 从站(1502) → edge-collector 按点位表轮询 → MQTT → 中间件标准化 → 后端`。点位表在 `edge-collector/configs/point-table.yml`：每条配置声明寄存器地址、`scale_factor`（定点寄存器→工程值）、`dead_zone`（变化死区，低于死区不重复上报）和采集周期；采集器同时代发设备心跳并在采集失败时发布 OFFLINE 状态。`start-all.ps1` 会自动拉起从站模拟器与采集器，新增设备只需修改点位表并重启采集器。
 
 当前运行时只依赖 Python 3.10+，不需要 Docker、Java、Maven、Node、MySQL 或第三方 Python 包即可验证通信核心。后续安装 Mosquitto、Paho MQTT、MySQL 和 Java 后，可按同样的 topic/API 边界替换对应适配器。
 

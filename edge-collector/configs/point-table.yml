@@ -1,0 +1,38 @@
+# 点位表:采集器按此配置轮询 Modbus 从站。
+# engineering value = register value * scale_factor(定点寄存器 → 工程量)。
+gateway:
+  id: gw-001
+  host: 127.0.0.1
+  port: 1502
+  heartbeat_interval_sec: 10
+
+points:
+  - device_code: MODBUS-PLC-001
+    point_code: temperature
+    register: 0
+    slave_id: 1
+    register_type: holding
+    scale_factor: 0.1        # HR0 = temperature x 10
+    dead_zone: 0.1
+    collect_interval_ms: 1000
+    unit: C
+
+  - device_code: MODBUS-PLC-001
+    point_code: pressure
+    register: 1
+    slave_id: 1
+    register_type: holding
+    scale_factor: 0.001      # HR1 = pressure x 1000
+    dead_zone: 0.002
+    collect_interval_ms: 1000
+    unit: MPa
+
+  - device_code: MODBUS-TANK-001
+    point_code: liquid_level
+    register: 2
+    slave_id: 1
+    register_type: holding
+    scale_factor: 0.1        # HR2 = liquid level x 10
+    dead_zone: 0.2
+    collect_interval_ms: 2000
+    unit: "%"
