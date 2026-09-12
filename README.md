@@ -48,12 +48,24 @@ python -m sim_devices.main --scenario high-temperature
 python -m sim_devices.main --scenario heartbeat-loss
 ```
 
+## 测试
+
+```powershell
+.\scripts\run-tests.ps1
+```
+
+覆盖:MQTT 协议栈(通配符匹配、QoS 1 ACK/DUP 重发、retain 重放、遗嘱触发/抑制、keepalive 超时)、中间件去重与心跳序列、设备控制 API、后端消息处理(NaN 拒绝、告警生命周期、注册表过滤),以及可选的 Paho 互操作、MySQL schema 校验和 Maven 测试。
+
 ## 核心参数
 
-- MQTT Keep Alive：30 秒，客户端自动发送 PINGREQ，Broker 返回 PINGRESP。
-- 业务心跳：10 秒一次；20 秒进入 SUSPECTED，30 秒进入 OFFLINE。
-- 重连退避：1、2、4、8、16、32、60 秒，并加入 0.8~1.2 随机抖动。
-- 数据 QoS 语义：至少一次投递；`eventId` 用于业务去重。
-- 遗嘱消息：设备非正常断开时发布 retained OFFLINE 状态。
+- MQTT Keep Alive:30 秒,客户端自动发送 PINGREQ,Broker 返回 PINGRESP;超过 1.5 倍 Keep Alive 无报文的连接会被 Broker 强制断开并触发遗嘱。
+- 业务心跳:10 秒一次;20 秒进入 SUSPECTED,30 秒进入 OFFLINE。
+- 重连退避:1、2、4、8、16、32、60 秒,并加入 0.8~1.2 随机抖动。
+- 数据 QoS 语义:至少一次投递 —— QoS 1 发布 5 秒内未收到 PUBACK 会带 DUP 标志重发;`eventId` 用于业务去重。
+- 遗嘱消息:设备非正常断开时发布 retained OFFLINE 状态;正常 DISCONNECT 不触发遗嘱。
+- 告警规则:`temperature` 测点超过 90 触发 SERIOUS 告警,回落到阈值以下自动恢复,并持久化到 `iot_alarm_record`。
+- 历史数据:`/api/history` 优先查询 MySQL(`iot_history_data`),数据库不可用时回退内存最近 100 条。
 
-日志位于 `logs/`，可直接用于测试报告截图和问题定位。
+常用环境变量:`IOT_ADMIN_USER` / `IOT_ADMIN_PASSWORD`(登录凭据,默认 admin/admin123)、`IOT_ALARM_TEMPERATURE_THRESHOLD`(告警阈值,默认 90)、`IOT_AUTH_ENABLED=1`(数据接口要求 Bearer Token)、`IOT_CORS_ORIGINS`(允许跨域来源,默认本机 5173)、`IOT_DB_*`(MySQL 连接与开关)。
+
+日志位于 `logs/`,可直接用于测试报告截图和问题定位。

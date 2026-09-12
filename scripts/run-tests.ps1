@@ -4,9 +4,12 @@ $env:PYTHONPATH = "$root\middleware\src;$root\simulated-devices\src"
 Write-Host '== Python unit tests =='
 python -m unittest discover -s "$root\middleware\tests" -p 'test_*.py' -v
 python -m unittest discover -s "$root\simulated-devices\tests" -p 'test_*.py' -v
+python -m unittest discover -s "$root\frontend-backend\backend\tests" -p 'test_*.py' -v
 Write-Host '== Python syntax =='
 python -m compileall -q "$root\middleware\src" "$root\simulated-devices\src" "$root\frontend-backend\backend"
 Write-Host '== MQTT heartbeat probe =='
+# The probe talks to a live broker on 1883; start one if the stack is down.
+& "$PSScriptRoot\start-mqtt.ps1"
 @'
 import time
 from iot_middleware.local_mqtt import Client
