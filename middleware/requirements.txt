@@ -1,0 +1,3 @@
+# The core algorithms use the standard library. Paho is used for real MQTT
+# 3.1.1 interoperability checks and can be replaced by the local client.
+paho-mqtt>=2.0,<3

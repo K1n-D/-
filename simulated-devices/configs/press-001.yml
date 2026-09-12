@@ -1,0 +1,4 @@
+deviceCode: PRESS-001
+protocol: MQTT
+points:
+  pressure: {base: 0.55, variation: 0.04, unit: MPa}

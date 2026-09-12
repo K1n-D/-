@@ -1,0 +1,1 @@
+"""Industrial IoT communication middleware."""

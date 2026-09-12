@@ -1,0 +1,15 @@
+logs/*
+!logs/.gitkeep
+**/__pycache__/
+**/.venv/
+*.pyc
+*.db
+node_modules/
+dist/
+
+# Local runtime state and portable tools (never commit)
+work/
+outputs/
+BOOT-INF/
+mingit.zip
+simulated-devices/configs/runtime-devices.json

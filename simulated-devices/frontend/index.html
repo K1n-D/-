@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SimLab | 虚拟设备控制台</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">◈</span><div><strong>SIMLAB</strong><small>DEVICE STUDIO</small></div></div>
+      <div class="workspace"><span class="live-dot"></span><div><small>当前工作区</small><strong>FACTORY 001</strong></div></div>
+      <nav><a class="nav-link active" href="#devices"><span>▦</span>设备列表</a><a class="nav-link" href="#guide"><span>⌁</span>运行说明</a></nav>
+      <div class="sidebar-bottom"><div class="service-state"><span class="live-dot"></span><div><small>控制服务</small><strong id="serviceStatus">检测中</strong></div></div><a class="back-link" href="http://127.0.0.1:5173">↗ 返回工业监控台</a></div>
+    </aside>
+    <main class="main-content">
+      <header class="topbar"><div><p class="eyebrow">SIMULATED DEVICE LAB / LOCAL EDGE</p><h1>虚拟设备控制台</h1><p class="subtitle">独立管理设备实例，配置会实时通过 MQTT 同步到工业监控系统。</p></div><div class="top-actions"><span class="sync-label" id="syncLabel">最后同步 --:--:--</span><button class="icon-btn" id="refreshBtn" title="刷新设备">↻</button><button class="primary-btn" id="addBtn">＋ 添加设备</button></div></header>
+      <section class="stats-row"><div class="stat-card"><span class="stat-icon teal">◉</span><div><small>设备总数</small><strong id="totalCount">0</strong></div></div><div class="stat-card"><span class="stat-icon green">✓</span><div><small>正在运行</small><strong id="onlineCount">0</strong></div></div><div class="stat-card"><span class="stat-icon amber">⌁</span><div><small>采集速率</small><strong id="rateCount">0<span> msg/s</span></strong></div></div><div class="stat-card"><span class="stat-icon coral">!</span><div><small>需要关注</small><strong id="attentionCount">0</strong></div></div></section>
+      <section class="content-grid" id="devices"><div class="section-heading"><div><p class="eyebrow">DEVICE INVENTORY</p><h2>设备实例</h2></div><div class="filters"><label class="search"><span>⌕</span><input id="searchInput" placeholder="搜索设备编号或名称"></label><select id="statusFilter"><option value="ALL">全部状态</option><option value="ONLINE">运行中</option><option value="OFFLINE">已停用</option><option value="RECONNECTING">重连中</option></select></div></div><div id="deviceGrid" class="device-grid"></div><div id="emptyState" class="empty-state hidden"><span>＋</span><h3>还没有虚拟设备</h3><p>点击右上角添加第一台设备</p></div></section>
+      <section class="bottom-grid" id="guide"><article class="info-panel"><div class="panel-heading"><div><p class="eyebrow">LIVE PIPELINE</p><h2>同步链路</h2></div><span class="pipeline-badge"><i></i>实时</span></div><div class="pipeline"><div><b>01</b><span>属性配置</span><small>本地控制台</small></div><em>→</em><div><b>02</b><span>MQTT 发布</span><small>127.0.0.1:1883</small></div><em>→</em><div><b>03</b><span>工业监控</span><small>实时状态同步</small></div></div></article><article class="info-panel activity-panel"><div class="panel-heading"><div><p class="eyebrow">ACTIVITY LOG</p><h2>操作记录</h2></div><button class="text-btn" id="clearLogBtn">清空</button></div><div id="activityLog" class="activity-log"><p class="log-empty">暂无操作记录</p></div></article></section>
+      <footer>SIMLAB CONTROL PLANE <span>·</span> API 127.0.0.1:8091 <span>·</span> MQTT 3.1.1</footer>
+    </main>
+  </div>
+
+  <div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><p class="eyebrow">DEVICE CONFIGURATION</p><h2 id="modalTitle">添加虚拟设备</h2></div><button class="close-btn" id="closeModal" title="关闭">×</button></div><form id="deviceForm"><div class="form-grid"><label>设备编号<input id="deviceCode" required pattern="[A-Za-z0-9_-]+" placeholder="如 SIM-004"></label><label>显示名称<input id="deviceName" required placeholder="如 4 号装配线 PLC"></label><label>设备类型<select id="deviceType"><option value="PLC">PLC</option><option value="TEMPERATURE">温度传感器</option><option value="PRESSURE">压力传感器</option></select></label><label>运行场景<select id="scenario"><option value="normal">正常波动</option><option value="high-temperature">高温告警</option><option value="low-pressure">低压告警</option><option value="heartbeat-loss">心跳丢失</option></select></label><label>采集间隔（秒）<input id="intervalSec" type="number" min="0.2" max="60" step="0.1" value="1"></label><label>业务心跳（秒）<input id="heartbeatSec" type="number" min="2" max="300" step="1" value="10"></label></div><label class="toggle-row"><input id="enabled" type="checkbox" checked><span class="toggle"></span><span>保存后立即运行</span></label><div class="points-section"><div class="points-heading"><div><strong>测点属性</strong><small>每个测点都会发布到标准化数据流</small></div><div class="add-point"><input id="newPoint" placeholder="测点名称"><button type="button" class="small-btn" id="addPointBtn">添加</button></div></div><div id="pointRows"></div></div><div class="modal-actions"><button type="button" class="secondary-btn" id="cancelBtn">取消</button><button type="submit" class="primary-btn" id="saveBtn">保存设备</button></div></form></div></div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="./app.js"></script>
+</body>
+</html>

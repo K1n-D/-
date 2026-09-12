@@ -1,0 +1,4 @@
+deviceCode: TEMP-001
+protocol: MQTT
+points:
+  temperature: {base: 60, variation: 2, unit: C}

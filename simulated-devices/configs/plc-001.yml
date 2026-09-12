@@ -1,0 +1,6 @@
+deviceCode: PLC-001
+protocol: MQTT
+points:
+  temperature: {base: 65, variation: 3, unit: C}
+  pressure: {base: 0.65, variation: 0.05, unit: MPa}
+  liquid_level: {base: 72, variation: 5, unit: "%"}
