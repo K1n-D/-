@@ -1,10 +1,10 @@
 from __future__ import annotations
-import json, logging, os, sys, threading, time
+import json, logging, os, queue, sys, threading, time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "middleware" / "src"))
 from iot_middleware.local_mqtt import Client
 
@@ -217,19 +217,30 @@ class Persistence:
             (payload.get("deviceCode"), payload.get("deviceCode"), payload.get("sourceProtocol", "MQTT")),
         )
 
-    def history(self, limit=500):
+    def history(self, limit=500, device=None, point=None):
         """Latest stored telemetry, or None when the database is unavailable so
         callers can fall back to the in-memory buffer."""
         with self.lock:
             if self.conn is None and not self.connect():
                 return None
             try:
+                sql = """SELECT event_id, device_code, point_code, value_decimal, value_text,
+                                unit, quality, source_protocol, collect_time
+                         FROM iot_history_data"""
+                conditions, params = [], []
+                if device:
+                    conditions.append("device_code=%s")
+                    params.append(device)
+                if point:
+                    conditions.append("point_code=%s")
+                    params.append(point)
+                if conditions:
+                    sql += " WHERE " + " AND ".join(conditions)
+                sql += " ORDER BY id DESC LIMIT %s"
+                params.append(limit)
                 cur = self.conn.cursor()
                 try:
-                    cur.execute(
-                        """SELECT event_id, device_code, point_code, value_decimal, value_text,
-                                  unit, quality, source_protocol, collect_time
-                           FROM iot_history_data ORDER BY id DESC LIMIT %s""", (limit,))
+                    cur.execute(sql, tuple(params))
                     rows = cur.fetchall()
                 finally:
                     cur.close()
@@ -336,6 +347,12 @@ DB.connect()
 DATA = {"devices": {}, "telemetry": deque(maxlen=500), "alarms": deque(maxlen=MAX_ALARMS),
         "stats": {"received": 0}, "startedAt": time.time()}
 LOCK = threading.RLock()
+
+# Server-Sent Events: one queue per connected dashboard; process_message
+# fans every telemetry reading out to them so the UI does not need to poll
+# for real-time values.
+SSE_CLIENTS: list = []
+SSE_LOCK = threading.Lock()
 
 # Devices register themselves through retained registry messages published on
 # factory/FACTORY-001/device/registry.  Every access path (the MQTT-direct
@@ -496,6 +513,11 @@ def process_message(topic, payload):
             d["lastDataTime"] = payload["timestamp"]
             d["status"] = "ONLINE"
             DB.telemetry(payload)
+            for client_queue in list(SSE_CLIENTS):
+                try:
+                    client_queue.put_nowait(payload)
+                except queue.Full:
+                    pass
             value = payload.get("value")
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 evaluate_rules(code, payload["pointCode"], value, time.time())
@@ -602,6 +624,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             return self.send_json({"status": "UP", "broker": "local-mqtt",
                                    "uptimeSeconds": int(time.time() - DATA["startedAt"])})
+        if path == "/api/stream":
+            return self.stream_events()
         if not self.require_auth():
             return
         with LOCK:
@@ -614,12 +638,24 @@ class Handler(BaseHTTPRequestHandler):
                                        "messages": DATA["stats"]["received"],
                                        "alarms": len([a for a in DATA["alarms"] if a["status"] == "ACTIVE"])})
             if path == "/api/history":
-                stored = DB.history(limit=500)
+                params = parse_qs(urlparse(self.path).query)
+                device = (params.get("device") or [None])[0]
+                point = (params.get("point") or [None])[0]
+                try:
+                    limit = min(1000, int((params.get("limit") or ["300"])[0]))
+                except ValueError:
+                    limit = 300
+                stored = DB.history(limit=limit, device=device, point=point)
                 if stored is not None:
                     return self.send_json(stored)
                 # Database unavailable: serve the in-memory ring buffer instead
                 # of failing, mirroring the write path's fallback behaviour.
-                return self.send_json(list(DATA["telemetry"])[-100:])
+                buffered = list(DATA["telemetry"])
+                if device:
+                    buffered = [row for row in buffered if row.get("deviceCode") == device]
+                if point:
+                    buffered = [row for row in buffered if row.get("pointCode") == point]
+                return self.send_json(buffered[-limit:])
             if path == "/api/alarms":
                 return self.send_json(list(DATA["alarms"]))
             if path == "/api/points":
@@ -627,6 +663,32 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/alarm-rules":
                 return self.send_json(DB.alarm_rules() or [])
         return self.send_json({"error": "not found"}, 404)
+
+    def stream_events(self):
+        """Serve one Server-Sent Events connection until the client hangs up."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
+        self.end_headers()
+        client_queue = queue.Queue(maxsize=200)
+        with SSE_LOCK:
+            SSE_CLIENTS.append(client_queue)
+        try:
+            while True:
+                try:
+                    payload = client_queue.get(timeout=15)
+                    line = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                except queue.Empty:
+                    line = ": ping\n\n"  # keep intermediaries from closing the stream
+                self.wfile.write(line.encode())
+                self.wfile.flush()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            with SSE_LOCK:
+                if client_queue in SSE_CLIENTS:
+                    SSE_CLIENTS.remove(client_queue)
 
     def do_PUT(self):
         path = urlparse(self.path).path
