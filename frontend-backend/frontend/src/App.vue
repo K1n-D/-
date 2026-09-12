@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
 type Telemetry = { deviceCode: string; pointCode: string; value: number | boolean; unit?: string; timestamp: string; quality?: string }
 type Device = { deviceCode: string; status?: string; lastHeartbeat?: string; lastDataTime?: string; points?: Record<string, Telemetry> }
 type Alarm = { deviceCode: string; pointCode: string; level: string; value: number; status: string; time: number }
 type Stats = { deviceTotal: number; online: number; offline: number; messages: number; alarms: number }
-type ViewKey = 'dashboard' | 'devices' | 'history' | 'alarms' | 'connection'
+type ViewKey = 'dashboard' | 'devices' | 'history' | 'alarms' | 'config' | 'connection'
 
 const api = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8080'
 const token = ref(localStorage.getItem('iot-monitor-token') || '')
@@ -14,10 +14,12 @@ const loginName = ref('admin'), loginPassword = ref('admin123'), loginBusy = ref
 const currentView = ref<ViewKey>('dashboard'), health = ref('连接中'), middleware = ref('local-mqtt')
 const stats = ref<Stats>({ deviceTotal: 0, online: 0, offline: 0, messages: 0, alarms: 0 })
 const devices = ref<Device[]>([]), telemetry = ref<Telemetry[]>([]), alarms = ref<Alarm[]>([]), error = ref(''), lastUpdated = ref('')
+const pointRows = ref<any[]>([])
 let timer: number | undefined
 const navItems: { key: ViewKey; label: string; icon: string }[] = [
   { key: 'dashboard', label: '运行总览', icon: '▦' }, { key: 'devices', label: '设备状态', icon: '◉' },
-  { key: 'history', label: '历史数据', icon: '⌁' }, { key: 'alarms', label: '告警中心', icon: '!' }, { key: 'connection', label: '链路监控', icon: '⌘' }
+  { key: 'history', label: '历史数据', icon: '⌁' }, { key: 'alarms', label: '告警中心', icon: '!' },
+  { key: 'config', label: '采集配置', icon: '⚙' }, { key: 'connection', label: '链路监控', icon: '⌘' }
 ]
 const healthClass = computed(() => health.value === '正常' ? 'healthy' : health.value === '连接中' ? 'pending' : 'danger')
 const pageTitle = computed(() => navItems.find(item => item.key === currentView.value)?.label || '运行总览')
@@ -56,6 +58,18 @@ async function load() {
     error.value = `无法连接后端服务（${api}），正在自动重试。${message}`
   }
 }
+async function loadPoints() { try { pointRows.value = await request('/api/points') } catch { pointRows.value = [] } }
+async function savePoint(row: any) {
+  try {
+    await request(`/api/points/${encodeURIComponent(row.deviceCode)}/${encodeURIComponent(row.pointCode)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scaleFactor: Number(row.scaleFactor), deadZone: Number(row.deadZone), collectIntervalMs: Number(row.collectIntervalMs), unit: row.unit })
+    })
+    error.value = ''
+    await loadPoints()
+  } catch (cause) { error.value = `保存失败（${cause instanceof Error ? cause.message : '未知错误'}）` }
+}
+watch(currentView, view => { if (view === 'config') loadPoints() })
 onMounted(() => { if (token.value) load(); timer = window.setInterval(load, 3000) }); onUnmounted(() => { if (timer) window.clearInterval(timer) })
 </script>
 
@@ -66,5 +80,6 @@ onMounted(() => { if (token.value) load(); timer = window.setInterval(load, 3000
   <template v-else-if="currentView === 'devices'"><section class="surface full-panel"><div class="surface-head"><div><p class="eyebrow">DEVICE FLEET</p><h2>全部设备</h2></div><span class="count-label">{{ devices.length }} 台设备</span></div><div class="table-scroll"><table class="wide-table"><thead><tr><th>设备编号</th><th>当前状态</th><th>测点数量</th><th>最近心跳</th><th>最近数据</th><th>当前读数</th></tr></thead><tbody><tr v-for="device in devices" :key="device.deviceCode"><td class="mono strong-cell">{{ device.deviceCode }}</td><td><span :class="['status-label', statusClass(device.status)]">{{ statusLabel(device.status) }}</span></td><td>{{ Object.keys(device.points || {}).length }} 个</td><td>{{ formatTime(device.lastHeartbeat) }}</td><td>{{ formatTime(device.lastDataTime) }}</td><td><span v-for="point in Object.keys(device.points || {}).slice(0, 2)" :key="point" class="reading-chip">{{ point }} {{ device.points?.[point]?.value }}{{ device.points?.[point]?.unit }}</span></td></tr><tr v-if="!devices.length"><td colspan="6" class="empty-state">暂无设备数据</td></tr></tbody></table></div></section></template>
   <template v-else-if="currentView === 'history'"><section class="surface full-panel"><div class="surface-head"><div><p class="eyebrow">NORMALIZED TELEMETRY</p><h2>历史数据</h2></div><span class="count-label">共 {{ sortedTelemetry.length }} 条</span></div><div class="table-scroll"><table class="wide-table"><thead><tr><th>采集时间</th><th>设备</th><th>测点</th><th>数值</th><th>单位</th><th>数据质量</th></tr></thead><tbody><tr v-for="row in sortedTelemetry" :key="`${row.deviceCode}-${row.pointCode}-${row.timestamp}`"><td>{{ formatDate(row.timestamp) }}</td><td class="mono strong-cell">{{ row.deviceCode }}</td><td>{{ row.pointCode }}</td><td class="table-value">{{ row.value }}</td><td>{{ row.unit || '--' }}</td><td><span class="quality-tag">{{ row.quality || 'GOOD' }}</span></td></tr><tr v-if="!sortedTelemetry.length"><td colspan="6" class="empty-state">暂无历史数据</td></tr></tbody></table></div></section></template>
   <template v-else-if="currentView === 'alarms'"><section class="surface full-panel"><div class="surface-head"><div><p class="eyebrow">ALERT MANAGEMENT</p><h2>告警中心</h2></div><span :class="['count-label', { alert: stats.alarms }]">{{ stats.alarms ? `${stats.alarms} 条活动告警` : '系统运行平稳' }}</span></div><div v-if="alarms.length" class="alarm-table"><div v-for="alarm in alarms" :key="`${alarm.deviceCode}-${alarm.pointCode}-${alarm.time}`" class="alarm-card"><span :class="['alarm-severity', alarm.level === 'SERIOUS' ? 'serious' : 'warning']">!</span><div class="alarm-card-main"><strong>{{ alarm.deviceCode }} <span>/</span> {{ alarm.pointCode }}</strong><p>检测值 <b>{{ alarm.value }}</b> · {{ alarmLevel(alarm.level) }}阈值</p></div><span :class="['alarm-status', alarm.status === 'ACTIVE' ? 'active' : 'resolved']">{{ alarm.status === 'ACTIVE' ? '活动' : '已恢复' }}</span><time>{{ formatDate(new Date(alarm.time * 1000).toISOString()) }}</time></div></div><div v-else class="empty-large"><span>✓</span><h3>暂无告警记录</h3><p>所有设备均在设定范围内运行</p></div></section></template>
+  <template v-else-if="currentView === 'config'"><section class="surface full-panel"><div class="surface-head"><div><p class="eyebrow">POINT TABLE</p><h2>采集配置</h2></div><span class="count-label">共 {{ pointRows.length }} 个测点 · 缩放 = 寄存器值 × 系数 · 修改后重启采集器生效</span></div><div class="table-scroll"><table class="wide-table"><thead><tr><th>设备编号</th><th>测点</th><th>寄存器</th><th>寄存器类型</th><th>缩放系数</th><th>死区</th><th>采集周期 (ms)</th><th>单位</th><th>操作</th></tr></thead><tbody><tr v-for="row in pointRows" :key="`${row.deviceCode}/${row.pointCode}`"><td class="mono strong-cell">{{ row.deviceCode }}</td><td>{{ row.pointCode }}</td><td class="mono">{{ row.register }}</td><td>{{ row.registerType }}</td><td><input class="cell-input" type="number" step="0.001" v-model="row.scaleFactor"></td><td><input class="cell-input" type="number" step="0.001" min="0" v-model="row.deadZone"></td><td><input class="cell-input" type="number" step="100" min="200" v-model="row.collectIntervalMs"></td><td><input class="cell-input" v-model="row.unit"></td><td><button class="text-button" @click="savePoint(row)">保存 <span>→</span></button></td></tr><tr v-if="!pointRows.length"><td colspan="9" class="empty-state">暂无点位配置（数据库不可用或无记录）</td></tr></tbody></table></div></section></template>
   <template v-else><section class="connection-grid"><article class="surface connection-card large"><div class="surface-head"><div><p class="eyebrow">SERVICE HEALTH</p><h2>链路状态</h2></div><span class="health-badge"><i></i>全部正常</span></div><div class="service-row"><span class="service-icon mqtt">⌁</span><div><strong>MQTT Broker</strong><small>127.0.0.1:1883</small></div><b>CONNECTED</b></div><div class="service-row"><span class="service-icon middleware">◈</span><div><strong>通信中间件</strong><small>心跳与重连监控 · 8090</small></div><b>CONNECTED</b></div><div class="service-row"><span class="service-icon backend">⌘</span><div><strong>业务后端</strong><small>数据持久化与 API · 8080</small></div><b>UP</b></div></article><article class="surface metrics-card"><div class="surface-head"><div><p class="eyebrow">MESSAGE PIPELINE</p><h2>消息管线</h2></div></div><div class="metric-line"><span>累计消息</span><strong>{{ stats.messages.toLocaleString() }}</strong></div><div class="metric-line"><span>当前设备</span><strong>{{ stats.deviceTotal }}</strong></div><div class="metric-line"><span>在线率</span><strong>{{ stats.deviceTotal ? Math.round(stats.online / stats.deviceTotal * 100) : 0 }}%</strong></div><div class="metric-line"><span>刷新间隔</span><strong>3s</strong></div></article></section></template><footer class="main-footer"><span>ORBITAL INDUSTRIAL SYSTEMS</span><span>LOCAL EDGE MONITOR · MQTT 3.1.1</span></footer></main></div>
 </template>

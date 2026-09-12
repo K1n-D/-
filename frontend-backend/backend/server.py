@@ -124,6 +124,79 @@ class Persistence:
                 self.conn = None
                 return False
 
+    def query(self, sql, params=()):
+        """Run a SELECT; returns rows or None when the database is down."""
+        with self.lock:
+            if self.conn is None and not self.connect():
+                return None
+            try:
+                cur = self.conn.cursor()
+                try:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+                finally:
+                    cur.close()
+                return rows
+            except Exception as exc:
+                self.last_error = str(exc)
+                logging.warning("query failed: %s", exc)
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+                return None
+
+    def point_configs(self):
+        rows = self.query(
+            """SELECT device_code, point_code, slave_id, register, register_type,
+                      scale_factor, dead_zone, collect_interval_ms, unit, enabled
+               FROM iot_point_config ORDER BY device_code, point_code""")
+        if rows is None:
+            return None
+        return [{"deviceCode": d, "pointCode": p, "slaveId": s, "register": r,
+                 "registerType": t, "scaleFactor": float(sf), "deadZone": float(dz),
+                 "collectIntervalMs": ci, "unit": u, "enabled": bool(en)}
+                for d, p, s, r, t, sf, dz, ci, u, en in rows]
+
+    POINT_EDITABLE = {"scale_factor": "scaleFactor", "dead_zone": "deadZone",
+                      "collect_interval_ms": "collectIntervalMs", "unit": "unit",
+                      "enabled": "enabled"}
+
+    def update_point(self, device_code, point_code, fields):
+        """Apply a partial update to one point-table row (whitelisted columns)."""
+        sets, params = [], []
+        for column, key in self.POINT_EDITABLE.items():
+            if key not in fields:
+                continue
+            value = fields[key]
+            if column == "unit":
+                value = str(value)[:32]
+            elif column == "enabled":
+                value = 1 if value else 0
+            elif column == "collect_interval_ms":
+                value = max(200, int(value))
+            else:
+                value = float(value)
+            sets.append(f"{column}=%s")
+            params.append(value)
+        if not sets:
+            return False
+        params += [device_code, point_code]
+        return self.execute(
+            f"UPDATE iot_point_config SET {', '.join(sets)} WHERE device_code=%s AND point_code=%s",
+            tuple(params))
+
+    def alarm_rules(self):
+        rows = self.query(
+            """SELECT device_code, point_code, operator, threshold, duration_sec,
+                      hysteresis, level, enabled FROM iot_alarm_rule ORDER BY id""")
+        if rows is None:
+            return None
+        return [{"deviceCode": d, "pointCode": p, "operator": op, "threshold": float(th),
+                 "durationSec": du, "hysteresis": float(hy), "level": lv, "enabled": bool(en)}
+                for d, p, op, th, du, hy, lv, en in rows]
+
     def telemetry(self, payload):
         value = payload.get("value")
         numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -473,6 +546,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(list(DATA["telemetry"])[-100:])
             if path == "/api/alarms":
                 return self.send_json(list(DATA["alarms"]))
+            if path == "/api/points":
+                return self.send_json(DB.point_configs() or [])
+            if path == "/api/alarm-rules":
+                return self.send_json(DB.alarm_rules() or [])
+        return self.send_json({"error": "not found"}, 404)
+
+    def do_PUT(self):
+        path = urlparse(self.path).path
+        parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "points"]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                fields = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                return self.send_json({"error": "invalid request"}, 400)
+            if not isinstance(fields, dict):
+                return self.send_json({"error": "invalid request"}, 400)
+            ok = DB.update_point(parts[2].upper(), parts[3], fields)
+            if ok:
+                return self.send_json({"ok": True})
+            return self.send_json({"error": "point not found or database unavailable"}, 404)
         return self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):

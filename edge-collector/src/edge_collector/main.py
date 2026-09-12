@@ -1,5 +1,9 @@
 """Edge collector entry point.
 
+The point table (the facts about which registers to poll) lives in MySQL
+(``iot_point_config``); this process reads it at startup and falls back to
+the YAML file when the database is unavailable.
+
 Run:  python -m edge_collector.main --config edge-collector/configs/point-table.yml
 """
 from __future__ import annotations
@@ -15,20 +19,79 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "middleware" / "src"))
 
 from edge_collector.collector import CollectorDevice
-from edge_collector.point_table import load_point_table
+from edge_collector.point_table import GatewayConfig, PointConfig, load_point_table
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
+def load_points_from_db():
+    """Read the enabled point-table rows from MySQL; None when unavailable."""
+    try:
+        import mysql.connector
+    except ImportError:
+        return None
+    try:
+        conn = mysql.connector.connect(
+            host=os.getenv("IOT_DB_HOST", "127.0.0.1"),
+            port=int(os.getenv("IOT_DB_PORT", "3306")),
+            user=os.getenv("IOT_DB_USER", "root"),
+            password=os.getenv("IOT_DB_PASSWORD", "root1234"),
+            database=os.getenv("IOT_DB_NAME", "iot_monitor"),
+            autocommit=True,
+        )
+    except Exception as exc:
+        logging.warning("point-table database unavailable (%s), falling back to YAML", exc)
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT device_code, point_code, slave_id, register, register_type,
+                      scale_factor, dead_zone, collect_interval_ms, unit
+               FROM iot_point_config WHERE enabled=1 ORDER BY device_code, point_code""")
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as exc:
+        logging.warning("point-table query failed (%s), falling back to YAML", exc)
+        conn.close()
+        return None
+    conn.close()
+    return [PointConfig(device_code=r[0], point_code=r[1], slave_id=r[2], register=r[3],
+                        register_type=r[4], scale_factor=float(r[5]), dead_zone=float(r[6]),
+                        collect_interval_ms=r[7], unit=r[8]) for r in rows]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Modbus TCP edge collector")
-    parser.add_argument("--config", required=True, help="point-table YAML file")
+    parser.add_argument("--config", default=None, help="fallback point-table YAML file")
+    parser.add_argument("--slave-host", default=None, help="Modbus slave host (default: YAML or 127.0.0.1)")
+    parser.add_argument("--slave-port", type=int, default=None, help="Modbus slave port (default: YAML or 1502)")
     parser.add_argument("--mqtt-host", default=os.getenv("IOT_MQTT_HOST", "127.0.0.1"))
     parser.add_argument("--mqtt-port", type=int, default=int(os.getenv("IOT_MQTT_PORT", "1883")))
     args = parser.parse_args()
-    gateway = load_point_table(args.config)
+
+    fallback = load_point_table(args.config) if args.config else None
+    db_points = load_points_from_db()
+    if db_points:
+        source = "database"
+        gateway = GatewayConfig(
+            id=(fallback.id if fallback else "gw-001"),
+            host=args.slave_host or (fallback.host if fallback else "127.0.0.1"),
+            port=args.slave_port or (fallback.port if fallback else 1502),
+            heartbeat_interval_sec=(fallback.heartbeat_interval_sec if fallback else 10.0),
+            points=db_points,
+        )
+    elif fallback:
+        source = "yaml fallback"
+        gateway = fallback
+        if args.slave_host:
+            gateway.host = args.slave_host
+        if args.slave_port:
+            gateway.port = args.slave_port
+    else:
+        raise SystemExit("no point table: database unavailable and no --config YAML given")
+
     collector = CollectorDevice(gateway, mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port)
-    print(f"[edge-collector] gateway={gateway.id} points={len(gateway.points)} "
+    print(f"[edge-collector] gateway={gateway.id} source={source} points={len(gateway.points)} "
           f"devices={collector.device_codes} modbus={gateway.host}:{gateway.port}", flush=True)
     try:
         collector.run()
