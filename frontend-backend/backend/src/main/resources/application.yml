@@ -1,8 +1,0 @@
-server:
-  port: 8081
-spring:
-  application:
-    name: industrial-iot-backend
-  mvc:
-    async:
-      request-timeout: 30000

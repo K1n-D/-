@@ -57,7 +57,13 @@ python -m sim_devices.main --scenario heartbeat-loss
 .\scripts\run-tests.ps1
 ```
 
-覆盖:MQTT 协议栈(通配符匹配、QoS 1 ACK/DUP 重发、retain 重放、遗嘱触发/抑制、keepalive 超时)、中间件去重与心跳序列、设备控制 API、后端消息处理(NaN 拒绝、告警生命周期、注册表过滤),以及可选的 Paho 互操作、MySQL schema 校验和 Maven 测试。
+覆盖:MQTT 协议栈(通配符匹配、QoS 1 ACK/DUP 重发、retain 重放、遗嘱触发/抑制、keepalive 超时)、中间件去重与心跳序列、Modbus 边缘采集(真实从站端到端)、设备控制 API、后端消息处理(NaN 拒绝、规则告警生命周期、注册表过滤),共 40+ 用例;推送后在 GitHub Actions 上自动执行(`.github/workflows/ci.yml`),并构建前端。
+
+## 架构
+
+`PLC/仪表 → edge-collector(点位表轮询)→ MQTT → 中间件标准化/去重 → 后端(MySQL 持久化 + 规则告警引擎 + SSE 实时推送)→ Vue 监控台`。
+
+两种设备接入方式并存:MQTT 直连(模拟器,控制台 8091 可动态管理)与 Modbus TCP 网关采集(`edge-collector`,真实设备同路径)。告警规则存储于 `iot_alarm_rule`,支持阈值、持续时长门限、滞回与确认(ACK)。
 
 ## 核心参数
 

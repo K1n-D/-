@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}/middleware/src:${{ github.workspace }}/simulated-devices/src:${{ github.workspace }}/edge-collector/src
+      IOT_DB_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install "pymodbus>=3.9,<4" pyyaml
+      - name: Python syntax
+        run: python -m compileall -q middleware/src simulated-devices/src edge-collector/src frontend-backend/backend
+      - name: Middleware tests (MQTT stack, watchdog, normalization)
+        run: python -m unittest discover -s middleware/tests -p "test_*.py" -v
+      - name: Device simulator tests
+        run: python -m unittest discover -s simulated-devices/tests -p "test_*.py" -v
+      - name: Edge collector tests (live Modbus end-to-end)
+        run: python -m unittest discover -s edge-collector/tests -p "test_*.py" -v
+      - name: Backend message-handling tests
+        run: python -m unittest discover -s frontend-backend/backend/tests -p "test_*.py" -v
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        working-directory: frontend-backend/frontend
+        run: npm ci
+      - name: Build dashboard
+        working-directory: frontend-backend/frontend
+        run: npm run build

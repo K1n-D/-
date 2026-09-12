@@ -1,7 +1,0 @@
-app:
-  mqtt:
-    enabled: false
-    host: tcp://127.0.0.1:1883
-    client-id: java-backend-001
-    keep-alive: 30
-    topic: factory/+/telemetry/normalized

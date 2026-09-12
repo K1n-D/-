@@ -63,7 +63,7 @@ class CollectorEndToEnd(unittest.TestCase):
     def setUp(self):
         self.port = free_port()
         self.image = RegisterImage(scenario="normal")
-        env = dict(os.environ, PYTHONPATH=f"{ROOT / 'edge-collector' / 'src'};{ROOT / 'middleware' / 'src'}")
+        env = dict(os.environ, PYTHONPATH=f"{ROOT / 'edge-collector' / 'src'}{os.pathsep}{ROOT / 'middleware' / 'src'}")
         self.slave = subprocess.Popen(
             [sys.executable, "-u", "-X", "utf8", "-m", "edge_collector.slave",
              "--port", str(self.port), "--tick", "0.5"],
