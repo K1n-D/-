@@ -1,8 +1,10 @@
 from __future__ import annotations
 import json, logging, os, sys, threading, time
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "middleware" / "src"))
 from iot_middleware.local_mqtt import Client
 
@@ -17,6 +19,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# Alarm thresholds are configuration, not code.
+ALARM_TEMPERATURE_THRESHOLD = float(os.getenv("IOT_ALARM_TEMPERATURE_THRESHOLD", "90"))
+MAX_ALARMS = int(os.getenv("IOT_MAX_ALARMS", "200"))
+
+# Set IOT_AUTH_ENABLED=1 to require a Bearer token on data APIs. Off by default
+# so the local demo works out of the box; the login flow is unchanged.
+AUTH_ENABLED = os.getenv("IOT_AUTH_ENABLED", "0").lower() in {"1", "true", "yes"}
+AUTH_TOKEN = os.getenv("IOT_AUTH_TOKEN", "local-demo-token")
+ADMIN_USER = os.getenv("IOT_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("IOT_ADMIN_PASSWORD", "admin123")
+
+# The browser pages live on 5173; anything else is not entitled to read the API
+# cross-origin. Override with IOT_CORS_ORIGINS if the demo is served elsewhere.
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv(
+    "IOT_CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173").split(",") if o.strip()]
+
+
+def utcnow_naive():
+    """Naive UTC timestamp for MySQL TIMESTAMP columns (utcnow() is deprecated)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 def as_datetime(value):
     if not value:
@@ -24,7 +47,7 @@ def as_datetime(value):
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
     except (TypeError, ValueError):
-        return datetime.utcnow()
+        return utcnow_naive()
 
 
 class Persistence:
@@ -121,20 +144,75 @@ class Persistence:
             (payload.get("deviceCode"), payload.get("deviceCode"), payload.get("sourceProtocol", "MQTT")),
         )
 
+    def history(self, limit=500):
+        """Latest stored telemetry, or None when the database is unavailable so
+        callers can fall back to the in-memory buffer."""
+        with self.lock:
+            if self.conn is None and not self.connect():
+                return None
+            try:
+                cur = self.conn.cursor()
+                try:
+                    cur.execute(
+                        """SELECT event_id, device_code, point_code, value_decimal, value_text,
+                                  unit, quality, source_protocol, collect_time
+                           FROM iot_history_data ORDER BY id DESC LIMIT %s""", (limit,))
+                    rows = cur.fetchall()
+                finally:
+                    cur.close()
+            except Exception as exc:
+                self.last_error = str(exc)
+                logging.warning("history query failed: %s", exc)
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+                return None
+            result = []
+            for event_id, device_code, point_code, value_decimal, value_text, unit, quality, protocol, collect_time in rows:
+                result.append({
+                    "eventId": event_id,
+                    "deviceCode": device_code,
+                    "pointCode": point_code,
+                    "value": float(value_decimal) if value_decimal is not None else value_text,
+                    "unit": unit or "",
+                    "quality": quality,
+                    "sourceProtocol": protocol,
+                    "timestamp": collect_time.strftime("%Y-%m-%dT%H:%M:%SZ") if collect_time else None,
+                })
+            return result
+
+    def alarm_triggered(self, device_code, value, threshold):
+        self.execute(
+            """INSERT INTO iot_alarm_record
+               (device_code, point_code, alarm_type, alarm_level, trigger_value,
+                threshold_value, status, trigger_time)
+               VALUES (%s,'temperature','THRESHOLD','SERIOUS',%s,%s,'ACTIVE',%s)""",
+            (device_code, value, threshold, utcnow_naive()),
+        )
+
+    def alarm_resolved(self, device_code):
+        self.execute(
+            """UPDATE iot_alarm_record SET status='RESOLVED', recover_time=%s
+               WHERE device_code=%s AND point_code='temperature' AND status='ACTIVE'""",
+            (utcnow_naive(), device_code),
+        )
+
     def heartbeat(self, payload):
         self.execute(
             """INSERT INTO iot_heartbeat_log
                (device_code, client_id, sequence_no, sent_time, received_time, latency_ms, status, payload)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
             (payload.get("deviceCode"), payload.get("clientId"), payload.get("sequenceNo"),
-             as_datetime(payload.get("sentTime")), as_datetime(payload.get("receivedTime")) or datetime.utcnow(),
+             as_datetime(payload.get("sentTime")), as_datetime(payload.get("receivedTime")) or utcnow_naive(),
              payload.get("latencyMs"), payload.get("status", "ONLINE"), json.dumps(payload, ensure_ascii=False)),
         )
         self.execute(
             """INSERT INTO iot_device (device_code, device_name, protocol, status, last_heartbeat, created_at, updated_at)
                VALUES (%s,%s,'MQTT','ONLINE',%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                ON DUPLICATE KEY UPDATE status='ONLINE', last_heartbeat=VALUES(last_heartbeat), updated_at=CURRENT_TIMESTAMP""",
-            (payload.get("deviceCode"), payload.get("deviceCode"), as_datetime(payload.get("receivedTime")) or datetime.utcnow()),
+            (payload.get("deviceCode"), payload.get("deviceCode"), as_datetime(payload.get("receivedTime")) or utcnow_naive()),
         )
 
     def status(self, payload, old_status=None):
@@ -143,7 +221,7 @@ class Persistence:
                (device_code, old_status, new_status, reason, event_time)
                VALUES (%s,%s,%s,%s,%s)""",
             (payload.get("deviceCode"), old_status, payload.get("status", "UNKNOWN"), payload.get("reason"),
-             as_datetime(payload.get("timestamp")) or datetime.utcnow()),
+             as_datetime(payload.get("timestamp")) or utcnow_naive()),
         )
         # A removal is a terminal inventory operation.  Do not follow the
         # audit-log insert with an UPSERT, otherwise a deleted device would be
@@ -161,8 +239,9 @@ class Persistence:
 DB = Persistence()
 DB.connect()
 
-DATA={"devices":{},"telemetry":[],"alarms":[],"stats":{"received":0},"startedAt":time.time()}
-LOCK=threading.RLock()
+DATA = {"devices": {}, "telemetry": deque(maxlen=500), "alarms": deque(maxlen=MAX_ALARMS),
+        "stats": {"received": 0}, "startedAt": time.time()}
+LOCK = threading.RLock()
 
 # The simulator publishes an authoritative retained inventory.  MQTT status
 # messages are also retained, so a broker can replay an old OFFLINE status
@@ -172,6 +251,7 @@ LOCK=threading.RLock()
 # it is connected before the simulator starts); in that short window normal
 # MQTT messages are still accepted so real devices are not blocked.
 ACTIVE_SIMULATOR_CODES = None
+
 
 def load_persisted_simulator_registry():
     """Use the simulator's durable inventory before MQTT retained delivery.
@@ -196,99 +276,204 @@ def load_persisted_simulator_registry():
     for code in codes:
         DATA["devices"].setdefault(code, {"deviceCode": code, "status": "OFFLINE", "points": {}})
 
+
+def evaluate_temperature_alarm(code, value):
+    """Open a SERIOUS alarm above the threshold and resolve it once the value
+    falls back; alarms were previously write-only and never recovered."""
+    active = [a for a in DATA["alarms"]
+              if a["deviceCode"] == code and a["pointCode"] == "temperature" and a["status"] == "ACTIVE"]
+    if value > ALARM_TEMPERATURE_THRESHOLD:
+        if not active:
+            DATA["alarms"].append({"deviceCode": code, "pointCode": "temperature", "level": "SERIOUS",
+                                   "value": value, "threshold": ALARM_TEMPERATURE_THRESHOLD,
+                                   "status": "ACTIVE", "time": time.time()})
+            DB.alarm_triggered(code, value, ALARM_TEMPERATURE_THRESHOLD)
+            logging.warning("alarm OPEN device=%s value=%s threshold=%s", code, value, ALARM_TEMPERATURE_THRESHOLD)
+        elif value > active[0]["value"]:
+            active[0]["value"] = value  # keep the worst reading while active
+    else:
+        for alarm in active:
+            alarm["status"] = "RESOLVED"
+            alarm["recoveredAt"] = time.time()
+            DB.alarm_resolved(code)
+            logging.info("alarm RESOLVED device=%s value=%s", code, value)
+
+
+def process_message(topic, payload):
+    """Apply one MQTT message to the in-memory state and the database.
+
+    Raises on malformed input so tests can assert the failure; consume() wraps
+    this in a catch-all so a single bad message can never kill the reader.
+    """
+    global ACTIVE_SIMULATOR_CODES
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a JSON object")
+    with LOCK:
+        if topic.endswith("/simulator/registry"):
+            active = set(payload.get("deviceCodes", [])) if isinstance(payload.get("deviceCodes"), list) else set()
+            ACTIVE_SIMULATOR_CODES = active
+            for code in list(DATA["devices"]):
+                if code not in active:
+                    DATA["devices"].pop(code, None)
+                    DB.execute("DELETE FROM iot_device WHERE device_code=%s", (code,))
+            for code in active:
+                DATA["devices"].setdefault(code, {"deviceCode": code, "status": "OFFLINE", "points": {}})
+            return
+        if topic.endswith("/telemetry/normalized"):
+            code = payload.get("deviceCode")
+            if not code:
+                raise ValueError("telemetry payload requires deviceCode")
+            if ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
+                logging.info("ignore telemetry for device outside simulator registry: %s", code)
+                return
+            DATA["stats"]["received"] += 1
+            DATA["telemetry"].append(payload)
+            d = DATA["devices"].setdefault(code, {"deviceCode": code, "status": "ONLINE", "points": {}})
+            d.setdefault("points", {})[payload["pointCode"]] = payload
+            d["lastDataTime"] = payload["timestamp"]
+            d["status"] = "ONLINE"
+            DB.telemetry(payload)
+            value = payload.get("value")
+            if payload["pointCode"] == "temperature" and isinstance(value, (int, float)) and not isinstance(value, bool):
+                evaluate_temperature_alarm(code, value)
+            return
+        if "/heartbeat" in topic:
+            code = payload.get("deviceCode")
+            if not code:
+                raise ValueError("heartbeat payload requires deviceCode")
+            if ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
+                logging.info("ignore heartbeat for device outside simulator registry: %s", code)
+                return
+            DATA["devices"].setdefault(code, {"deviceCode": code})["lastHeartbeat"] = payload.get("receivedTime")
+            DB.heartbeat(payload)
+            return
+        if topic.endswith("/status") and payload.get("deviceCode"):
+            code = payload["deviceCode"]
+            # REMOVED is an explicit deletion event and must always be
+            # honoured.  Other retained status messages from a deleted
+            # simulator are ignored once the authoritative registry is
+            # available, preventing stale devices from reappearing.
+            if payload.get("reason") != "REMOVED" and ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
+                logging.info("ignore status for device outside simulator registry: %s", code)
+                return
+            device = DATA["devices"].setdefault(code, {"deviceCode": code})
+            old_status = device.get("status")
+            if payload.get("reason") == "REMOVED":
+                DATA["devices"].pop(code, None)
+                if ACTIVE_SIMULATOR_CODES is not None:
+                    ACTIVE_SIMULATOR_CODES.discard(code)
+                DB.execute("DELETE FROM iot_device WHERE device_code=%s", (code,))
+                DB.status(payload, old_status)
+                return
+            device["status"] = payload.get("status")
+            DB.status(payload, old_status)
+            return
+        logging.debug("unhandled topic: %s", topic)
+
+
 def consume():
     load_persisted_simulator_registry()
-    def msg(topic,payload):
-        global ACTIVE_SIMULATOR_CODES
-        with LOCK:
-            if topic.endswith("/simulator/registry"):
-                active = set(payload.get("deviceCodes", [])) if isinstance(payload.get("deviceCodes"), list) else set()
-                ACTIVE_SIMULATOR_CODES = active
-                for code in list(DATA["devices"]):
-                    if code not in active:
-                        DATA["devices"].pop(code, None)
-                        DB.execute("DELETE FROM iot_device WHERE device_code=%s", (code,))
-                for code in active:
-                    DATA["devices"].setdefault(code, {"deviceCode": code, "status": "OFFLINE", "points": {}})
-                return
-            if topic.endswith("/telemetry/normalized"):
-                code = payload.get("deviceCode")
-                if ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
-                    logging.info("ignore telemetry for device outside simulator registry: %s", code)
-                    return
-                DATA["stats"]["received"]+=1; DATA["telemetry"].append(payload); DATA["telemetry"]=DATA["telemetry"][-500:]
-                d=DATA["devices"].setdefault(payload["deviceCode"],{"deviceCode":payload["deviceCode"],"status":"ONLINE","points":{}}); d.setdefault("points",{})[payload["pointCode"]]=payload; d["lastDataTime"]=payload["timestamp"]; d["status"]="ONLINE"
-                DB.telemetry(payload)
-                val=payload["value"]
-                if payload["pointCode"]=="temperature" and isinstance(val,(int,float)) and val>90: 
-                    if not any(a["deviceCode"]==d["deviceCode"] and a["pointCode"]=="temperature" and a["status"]=="ACTIVE" for a in DATA["alarms"]): DATA["alarms"].append({"deviceCode":d["deviceCode"],"pointCode":"temperature","level":"SERIOUS","value":val,"status":"ACTIVE","time":time.time()})
-            elif "/heartbeat" in topic:
-                code = payload.get("deviceCode")
-                if ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
-                    logging.info("ignore heartbeat for device outside simulator registry: %s", code)
-                    return
-                DATA["devices"].setdefault(payload.get("deviceCode"),{"deviceCode":payload.get("deviceCode")})["lastHeartbeat"]=payload.get("receivedTime")
-                DB.heartbeat(payload)
-            elif topic.endswith("/status") and payload.get("deviceCode"):
-                code = payload["deviceCode"]
-                # REMOVED is an explicit deletion event and must always be
-                # honoured.  Other retained status messages from a deleted
-                # simulator are ignored once the authoritative registry is
-                # available, preventing stale devices from reappearing.
-                if payload.get("reason") != "REMOVED" and ACTIVE_SIMULATOR_CODES is not None and code not in ACTIVE_SIMULATOR_CODES:
-                    logging.info("ignore status for device outside simulator registry: %s", code)
-                    return
-                device = DATA["devices"].setdefault(code,{"deviceCode":code})
-                old_status = device.get("status")
-                if payload.get("reason") == "REMOVED":
-                    DATA["devices"].pop(code, None)
-                    if ACTIVE_SIMULATOR_CODES is not None:
-                        ACTIVE_SIMULATOR_CODES.discard(code)
-                    DB.execute("DELETE FROM iot_device WHERE device_code=%s", (code,))
-                    DB.status(payload, old_status)
-                    return
-                device["status"] = payload.get("status")
-                DB.status(payload, old_status)
+
+    def msg(topic, payload):
+        try:
+            process_message(topic, payload)
+        except Exception:
+            # A malformed message must only cost the message, never the
+            # reader thread: losing it silently would freeze the dashboard
+            # on stale data with no error anywhere.
+            logging.exception("failed to process MQTT message topic=%s", topic)
+
     while True:
         try:
-            c=Client("backend-001",keepalive=30,on_message=msg); c.connect(); c.start_keepalive(); [c.subscribe(x) for x in ["factory/+/telemetry/normalized","factory/+/device/+/heartbeat","factory/+/device/+/status","factory/+/simulator/registry"]]
-            while c.running: time.sleep(1)
-        except OSError: time.sleep(2)
+            c = Client("backend-001", keepalive=30, on_message=msg)
+            c.connect()
+            c.start_keepalive()
+            for topic in ["factory/+/telemetry/normalized", "factory/+/device/+/heartbeat",
+                          "factory/+/device/+/status", "factory/+/simulator/registry"]:
+                c.subscribe(topic)
+            while c.running:
+                time.sleep(1)
+        except Exception as exc:
+            logging.warning("MQTT consumer reconnecting after: %s", exc)
+            time.sleep(2)
+
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self,*args): pass
-    def send_json(self,obj,status=200):
-        raw=json.dumps(obj,ensure_ascii=False).encode(); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers(); self.wfile.write(raw)
+    def log_message(self, *args): pass
+
+    def cors_origin(self):
+        origin = self.headers.get("Origin")
+        if origin in ALLOWED_ORIGINS:
+            return origin
+        return ALLOWED_ORIGINS[0] if ALLOWED_ORIGINS else ""
+
+    def send_json(self, obj, status=200):
+        raw = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def require_auth(self):
+        if not AUTH_ENABLED or self.headers.get("Authorization") == f"Bearer {AUTH_TOKEN}":
+            return True
+        self.send_json({"error": "unauthorized"}, 401)
+        return False
+
     def do_OPTIONS(self):
         # Vite runs on port 5173 while the API runs on 8080. Browser JSON
         # requests therefore need a CORS preflight response before login.
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Access-Control-Max-Age", "600")
         self.end_headers()
+
     def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/health":
+            return self.send_json({"status": "UP", "broker": "local-mqtt",
+                                   "uptimeSeconds": int(time.time() - DATA["startedAt"])})
+        if not self.require_auth():
+            return
         with LOCK:
-            if self.path=="/api/health": return self.send_json({"status":"UP","broker":"local-mqtt","uptimeSeconds":int(time.time()-DATA["startedAt"])})
-            if self.path.startswith("/api/devices"): return self.send_json(list(DATA["devices"].values()))
-            if self.path.startswith("/api/dashboard/statistics"): return self.send_json({"deviceTotal":len(DATA["devices"]),"online":sum(d.get("status")=="ONLINE" for d in DATA["devices"].values()),"offline":sum(d.get("status")=="OFFLINE" for d in DATA["devices"].values()),"messages":DATA["stats"]["received"],"alarms":len([a for a in DATA["alarms"] if a["status"]=="ACTIVE"])})
-            if self.path.startswith("/api/history"): return self.send_json(DATA["telemetry"][-100:])
-            if self.path.startswith("/api/alarms"): return self.send_json(DATA["alarms"])
-            return self.send_json({"error":"not found"},404)
+            if path == "/api/devices":
+                return self.send_json(list(DATA["devices"].values()))
+            if path == "/api/dashboard/statistics":
+                return self.send_json({"deviceTotal": len(DATA["devices"]),
+                                       "online": sum(d.get("status") == "ONLINE" for d in DATA["devices"].values()),
+                                       "offline": sum(d.get("status") == "OFFLINE" for d in DATA["devices"].values()),
+                                       "messages": DATA["stats"]["received"],
+                                       "alarms": len([a for a in DATA["alarms"] if a["status"] == "ACTIVE"])})
+            if path == "/api/history":
+                stored = DB.history(limit=500)
+                if stored is not None:
+                    return self.send_json(stored)
+                # Database unavailable: serve the in-memory ring buffer instead
+                # of failing, mirroring the write path's fallback behaviour.
+                return self.send_json(list(DATA["telemetry"])[-100:])
+            if path == "/api/alarms":
+                return self.send_json(list(DATA["alarms"]))
+        return self.send_json({"error": "not found"}, 404)
+
     def do_POST(self):
-        if self.path=="/api/auth/login":
+        path = urlparse(self.path).path
+        if path == "/api/auth/login":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except (ValueError, json.JSONDecodeError):
-                return self.send_json({"error":"invalid request"}, 400)
-            expected_user = os.getenv("IOT_ADMIN_USER", "admin")
-            expected_password = os.getenv("IOT_ADMIN_PASSWORD", "admin123")
-            if payload.get("username") != expected_user or payload.get("password") != expected_password:
-                return self.send_json({"error":"invalid credentials"}, 401)
-            return self.send_json({"token":"local-demo-token","user":{"username":expected_user,"role":"ADMIN"}})
-        return self.send_json({"ok":True})
+                return self.send_json({"error": "invalid request"}, 400)
+            if payload.get("username") != ADMIN_USER or payload.get("password") != ADMIN_PASSWORD:
+                return self.send_json({"error": "invalid credentials"}, 401)
+            return self.send_json({"token": AUTH_TOKEN, "user": {"username": ADMIN_USER, "role": "ADMIN"}})
+        return self.send_json({"error": "not found"}, 404)
 
-if __name__=="__main__":
-    threading.Thread(target=consume,daemon=True).start(); print("[backend] http://127.0.0.1:8080",flush=True); ThreadingHTTPServer(("127.0.0.1",8080),Handler).serve_forever()
+
+if __name__ == "__main__":
+    threading.Thread(target=consume, daemon=True).start()
+    print("[backend] http://127.0.0.1:8080", flush=True)
+    ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()

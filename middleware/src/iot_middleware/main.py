@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 class Middleware:
     def __init__(self):
         self.client_id="middleware-001"; self.client=None; self.devices={}; self.retries=0; self.running=True
-        self.stats={"received":0,"normalized":0,"invalid":0,"duplicates":0,"reconnects":0,"heartbeats":0,"lastMessage":None,"pingResponses":0,"pingTimeouts":0}
+        self.stats={"received":0,"normalized":0,"invalid":0,"duplicates":0,"reconnects":0,"heartbeats":0,"lastMessage":None,"pingResponses":0,"pingTimeouts":0,"loopSkipped":0}
         self.mqtt_state="DISCONNECTED"; self.last_ping_response=None; self.seen_events=set(); self.seen_order=deque(maxlen=10000)
 
     def start(self):
@@ -34,7 +34,13 @@ class Middleware:
     def on_message(self, topic, payload):
         self.stats["received"]+=1; self.stats["lastMessage"]=utc_now()
         if topic.endswith("/heartbeat"):
-            self.stats["heartbeats"]+=1; self._heartbeat(payload); return
+            self.stats["heartbeats"]+=1
+            if payload.get("forwardedBy") == self.client_id:
+                # Forwarded heartbeats are published on the same topic filter
+                # this client subscribes to; without this guard every forwarded
+                # copy loops back into on_message and is processed twice.
+                self.stats["loopSkipped"]+=1; return
+            self._heartbeat(payload); return
         try:
             data=normalize(payload); self.stats["normalized"]+=1
             event_id=data["eventId"]
@@ -60,7 +66,7 @@ class Middleware:
             self.stats["invalid"]+=1; logging.warning("heartbeat sequence rollback device=%s previous=%s current=%s",device,previous,sequence); return
         now=time.time(); info=self.devices.setdefault(device,{})
         info.update({"lastHeartbeat":now,"status":"ONLINE","latencyMs":max(0,int((now-sent)*1000)),"sequenceNo":sequence,"clientId":client_id})
-        forwarded={**payload,"receivedTime":utc_now(),"latencyMs":info["latencyMs"],"status":"ONLINE"}
+        forwarded={**payload,"receivedTime":utc_now(),"latencyMs":info["latencyMs"],"status":"ONLINE","forwardedBy":self.client_id}
         if self.client and self.client.running: self.client.publish(f"factory/FACTORY-001/device/{device}/heartbeat", forwarded, qos=1)
 
     def watchdog(self):
