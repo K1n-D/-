@@ -87,14 +87,29 @@ class Persistence:
                 return False
 
     def _ensure_schema(self):
-        schema = ROOT / "backend" / "src" / "main" / "resources" / "db" / "schema.sql"
-        if not schema.exists():
-            schema = Path(__file__).resolve().parent / "src" / "main" / "resources" / "db" / "schema.sql"
+        candidates = [
+            Path(__file__).resolve().parent / "db" / "schema.sql",
+            ROOT / "frontend-backend" / "backend" / "db" / "schema.sql",
+            # Legacy location from the removed Java variant.
+            Path(__file__).resolve().parent / "src" / "main" / "resources" / "db" / "schema.sql",
+        ]
+        schema = next((path for path in candidates if path.exists()), None)
+        if schema is None:
+            raise FileNotFoundError(f"schema.sql not found in any of: {candidates}")
         statements = [part.strip() for part in schema.read_text(encoding="utf-8").split(";") if part.strip()]
         cur = self.conn.cursor()
         try:
             for statement in statements:
                 cur.execute(statement)
+            # CREATE TABLE IF NOT EXISTS cannot add columns to an existing
+            # table, so the ack columns added later get migrated explicitly.
+            cur.execute(
+                """SELECT COUNT(*) FROM information_schema.COLUMNS
+                   WHERE table_schema=DATABASE() AND table_name='iot_alarm_record'
+                         AND column_name='ack_time'""")
+            if cur.fetchone()[0] == 0:
+                logging.info("migrating iot_alarm_record: adding ack columns")
+                cur.execute("ALTER TABLE iot_alarm_record ADD COLUMN ack_time TIMESTAMP NULL, ADD COLUMN ack_by VARCHAR(64) NULL")
         finally:
             cur.close()
 
@@ -189,13 +204,13 @@ class Persistence:
 
     def alarm_rules(self):
         rows = self.query(
-            """SELECT device_code, point_code, operator, threshold, duration_sec,
+            """SELECT id, device_code, point_code, operator, threshold, duration_sec,
                       hysteresis, level, enabled FROM iot_alarm_rule ORDER BY id""")
         if rows is None:
             return None
-        return [{"deviceCode": d, "pointCode": p, "operator": op, "threshold": float(th),
-                 "durationSec": du, "hysteresis": float(hy), "level": lv, "enabled": bool(en)}
-                for d, p, op, th, du, hy, lv, en in rows]
+        return [{"id": r[0], "deviceCode": r[1], "pointCode": r[2], "operator": r[3], "threshold": float(r[4]),
+                 "durationSec": r[5], "hysteresis": float(r[6]), "level": r[7], "enabled": bool(r[8])}
+                for r in rows]
 
     def telemetry(self, payload):
         value = payload.get("value")
@@ -217,16 +232,18 @@ class Persistence:
             (payload.get("deviceCode"), payload.get("deviceCode"), payload.get("sourceProtocol", "MQTT")),
         )
 
-    def history(self, limit=500, device=None, point=None):
+    def history(self, limit=500, device=None, point=None, since=None, until=None, interval=None):
         """Latest stored telemetry, or None when the database is unavailable so
-        callers can fall back to the in-memory buffer."""
+        callers can fall back to the in-memory buffer.
+
+        ``since``/``until`` narrow the time window (naive-UTC datetimes).
+        ``interval`` (seconds) enables SQL downsampling: one averaged row per
+        bucket instead of every raw reading.
+        """
         with self.lock:
             if self.conn is None and not self.connect():
                 return None
             try:
-                sql = """SELECT event_id, device_code, point_code, value_decimal, value_text,
-                                unit, quality, source_protocol, collect_time
-                         FROM iot_history_data"""
                 conditions, params = [], []
                 if device:
                     conditions.append("device_code=%s")
@@ -234,10 +251,29 @@ class Persistence:
                 if point:
                     conditions.append("point_code=%s")
                     params.append(point)
-                if conditions:
-                    sql += " WHERE " + " AND ".join(conditions)
-                sql += " ORDER BY id DESC LIMIT %s"
-                params.append(limit)
+                if since is not None:
+                    conditions.append("collect_time>=%s")
+                    params.append(since)
+                if until is not None:
+                    conditions.append("collect_time<=%s")
+                    params.append(until)
+                where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
+                if interval and interval > 0 and device and point:
+                    sql = ("""SELECT device_code, point_code,
+                                     FROM_UNIXTIME(AVG(UNIX_TIMESTAMP(collect_time))) AS bucket_time,
+                                     AVG(value_decimal) AS avg_value,
+                                     unit, quality, source_protocol
+                              FROM iot_history_data""" + where +
+                          """ GROUP BY device_code, point_code,
+                                     FLOOR(UNIX_TIMESTAMP(collect_time) / %s)
+                              ORDER BY bucket_time ASC LIMIT %s""")
+                    params += [interval, limit]
+                else:
+                    sql = ("""SELECT event_id, device_code, point_code, value_decimal, value_text,
+                                     unit, quality, source_protocol, collect_time
+                              FROM iot_history_data""" + where + " ORDER BY id DESC LIMIT %s")
+                    params.append(limit)
                 cur = self.conn.cursor()
                 try:
                     cur.execute(sql, tuple(params))
@@ -254,7 +290,13 @@ class Persistence:
                 self.conn = None
                 return None
             result = []
-            for event_id, device_code, point_code, value_decimal, value_text, unit, quality, protocol, collect_time in rows:
+            for row in rows:
+                if interval and interval > 0 and device and point:
+                    device_code, point_code, bucket_time, avg_value, unit, quality, protocol = row
+                    event_id, value_text, collect_time = None, None, bucket_time
+                    value_decimal = avg_value
+                else:
+                    event_id, device_code, point_code, value_decimal, value_text, unit, quality, protocol, collect_time = row
                 result.append({
                     "eventId": event_id,
                     "deviceCode": device_code,
@@ -292,6 +334,44 @@ class Persistence:
                      ORDER BY id DESC LIMIT 1) latest)""",
             (utcnow_naive(), device_code, point_code),
         )
+
+    RULE_EDITABLE = {"operator": str, "threshold": float, "duration_sec": int,
+                     "hysteresis": float, "level": str, "enabled": bool}
+
+    def alarm_rule_insert(self, device_code, point_code, operator, threshold,
+                          duration_sec, hysteresis, level):
+        return self.execute(
+            """INSERT INTO iot_alarm_rule
+               (device_code, point_code, operator, threshold, duration_sec, hysteresis, level)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (device_code.upper(), point_code, operator, threshold, duration_sec, hysteresis, level))
+
+    def alarm_rule_update(self, rule_id, fields):
+        sets, params = [], []
+        for column, caster in self.RULE_EDITABLE.items():
+            key = {"duration_sec": "durationSec", "operator": "operator",
+                   "threshold": "threshold", "hysteresis": "hysteresis",
+                   "level": "level", "enabled": "enabled"}[column]
+            if key not in fields:
+                continue
+            value = fields[key]
+            if caster is str:
+                value = str(value)[:20]
+            elif caster is int:
+                value = max(0, int(value))
+            elif caster is float:
+                value = float(value)
+            else:
+                value = 1 if value else 0
+            sets.append(f"{column}=%s")
+            params.append(value)
+        if not sets:
+            return False
+        params.append(rule_id)
+        return self.execute(f"UPDATE iot_alarm_rule SET {', '.join(sets)} WHERE id=%s", tuple(params))
+
+    def alarm_rule_delete(self, rule_id):
+        return self.execute("DELETE FROM iot_alarm_rule WHERE id=%s", (rule_id,))
 
     def alarm_rule_rows(self):
         """Raw rule rows for the engine (id + numeric fields), None if DB down."""
@@ -558,8 +638,47 @@ def process_message(topic, payload):
         logging.debug("unhandled topic: %s", topic)
 
 
+def restore_active_alarms():
+    """Rebuild the in-memory alarm list after a restart.
+
+    Without this the dashboard shows an empty alarm centre even though the
+    database still holds unresolved alarms. The matching rule's state is
+    marked active as well, so a device still in breach does not open a
+    duplicate alarm on the next reading.
+    """
+    load_rules(force=True)
+    rows = DB.query(
+        """SELECT device_code, point_code, alarm_level, trigger_value,
+                  threshold_value, trigger_time, ack_time
+           FROM iot_alarm_record WHERE status='ACTIVE' ORDER BY id""")
+    if not rows:
+        return
+    restored = 0
+    for device, point, level, value, threshold, trigger_time, ack_time in rows:
+        if len(DATA["alarms"]) >= MAX_ALARMS:
+            break
+        triggered = trigger_time.replace(tzinfo=timezone.utc).timestamp() if trigger_time else time.time()
+        # Carry the matching rule id: the recovery branch of evaluate_rules
+        # matches alarms by ruleId, so a restored alarm without it would
+        # stay ACTIVE forever.
+        alarm = {"deviceCode": device, "pointCode": point, "level": level,
+                 "value": float(value) if value is not None else None,
+                 "threshold": float(threshold) if threshold is not None else None,
+                 "status": "ACTIVE", "ack": ack_time is not None, "time": triggered}
+        for rule in RULE_ENGINE["rules"]:
+            if rule_matches(rule, device, point):
+                RULE_ENGINE["state"][(rule["id"], device)] = {"since": None, "active": True}
+                if alarm.get("ruleId") is None:
+                    alarm["ruleId"] = rule["id"]
+        DATA["alarms"].append(alarm)
+        restored += 1
+    if restored:
+        logging.info("restored %s active alarm(s) from the database", restored)
+
+
 def consume():
     load_persisted_registry()
+    restore_active_alarms()
 
     def msg(topic, payload):
         try:
@@ -645,7 +764,15 @@ class Handler(BaseHTTPRequestHandler):
                     limit = min(1000, int((params.get("limit") or ["300"])[0]))
                 except ValueError:
                     limit = 300
-                stored = DB.history(limit=limit, device=device, point=point)
+                try:
+                    interval = max(0, int((params.get("interval") or ["0"])[0]))
+                except ValueError:
+                    interval = 0
+                since = as_datetime((params.get("from") or [""])[0])
+                until = as_datetime((params.get("to") or [""])[0])
+                stored = DB.history(limit=limit, device=device, point=point,
+                                    since=since, until=until,
+                                    interval=interval if (since or until) else None)
                 if stored is not None:
                     return self.send_json(stored)
                 # Database unavailable: serve the in-memory ring buffer instead
@@ -690,30 +817,65 @@ class Handler(BaseHTTPRequestHandler):
                 if client_queue in SSE_CLIENTS:
                     SSE_CLIENTS.remove(client_queue)
 
+    def read_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return body if isinstance(body, dict) else None
+
     def do_PUT(self):
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         if len(parts) == 4 and parts[:2] == ["api", "points"]:
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                fields = json.loads(self.rfile.read(length) or b"{}")
-            except (ValueError, json.JSONDecodeError):
-                return self.send_json({"error": "invalid request"}, 400)
-            if not isinstance(fields, dict):
+            fields = self.read_body()
+            if fields is None:
                 return self.send_json({"error": "invalid request"}, 400)
             ok = DB.update_point(parts[2].upper(), parts[3], fields)
             if ok:
                 return self.send_json({"ok": True})
             return self.send_json({"error": "point not found or database unavailable"}, 404)
+        if len(parts) == 3 and parts[:2] == ["api", "alarm-rules"] and parts[2].isdigit():
+            fields = self.read_body()
+            if fields is None:
+                return self.send_json({"error": "invalid request"}, 400)
+            if not DB.alarm_rule_update(int(parts[2]), fields):
+                return self.send_json({"error": "rule not found or nothing to update"}, 404)
+            load_rules(force=True)
+            return self.send_json({"ok": True})
+        return self.send_json({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        parts = urlparse(self.path).path.strip("/").split("/")
+        if len(parts) == 3 and parts[:2] == ["api", "alarm-rules"] and parts[2].isdigit():
+            if DB.alarm_rule_delete(int(parts[2])):
+                load_rules(force=True)
+                return self.send_json({"ok": True})
+            return self.send_json({"error": "rule not found or database unavailable"}, 404)
         return self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path == "/api/alarms/ack":
+        if path == "/api/alarm-rules":
+            body = self.read_body()
+            if not body:
+                return self.send_json({"error": "invalid request"}, 400)
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(length) or b"{}")
-            except (ValueError, json.JSONDecodeError):
+                ok = DB.alarm_rule_insert(
+                    str(body.get("deviceCode", "*")), str(body.get("pointCode", "")),
+                    str(body.get("operator", ">")), float(body.get("threshold", 0)),
+                    int(body.get("durationSec", 0)), float(body.get("hysteresis", 0)),
+                    str(body.get("level", "SERIOUS")))
+            except (ValueError, TypeError):
+                return self.send_json({"error": "invalid rule fields"}, 400)
+            if not ok:
+                return self.send_json({"error": "database unavailable or duplicate rule"}, 400)
+            load_rules(force=True)
+            return self.send_json({"ok": True}, 201)
+        if path == "/api/alarms/ack":
+            body = self.read_body()
+            if not body:
                 return self.send_json({"error": "invalid request"}, 400)
             code, point = body.get("deviceCode"), body.get("pointCode")
             if not code or not point:
@@ -728,10 +890,8 @@ class Handler(BaseHTTPRequestHandler):
             DB.alarm_acked(code, point)
             return self.send_json({"ok": True, "acked": len(acked)})
         if path == "/api/auth/login":
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length) or b"{}")
-            except (ValueError, json.JSONDecodeError):
+            payload = self.read_body()
+            if not payload:
                 return self.send_json({"error": "invalid request"}, 400)
             if payload.get("username") != ADMIN_USER or payload.get("password") != ADMIN_PASSWORD:
                 return self.send_json({"error": "invalid credentials"}, 401)

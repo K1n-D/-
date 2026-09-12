@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("IOT_DB_ENABLED", "0")  # keep unit tests off the real MySQL
@@ -162,6 +163,41 @@ class ProcessMessageTests(unittest.TestCase):
                                {"deviceCode": "PLC-001", "status": "OFFLINE", "reason": "REMOVED"})
         self.assertNotIn("PLC-001", server.DATA["devices"])
         self.assertNotIn("PLC-001", server.ACTIVE_DEVICE_CODES_BY_SOURCE["mqtt-simulator"])
+
+
+class RestoreAlarmsTests(unittest.TestCase):
+    def setUp(self):
+        server.DATA["alarms"].clear()
+        server.RULE_ENGINE["state"] = {}
+        install_rule()
+
+    def test_restore_rebuilds_alarms_and_rule_state(self):
+        fake_rows = [("T-9", "temperature", "SERIOUS", 95.0, 90.0,
+                      datetime(2026, 9, 12, 10, 0, 0), None)]
+        original_query = server.DB.query
+        server.DB.query = lambda sql, params=(): (
+            fake_rows if "iot_alarm_record" in sql else None)
+        try:
+            server.restore_active_alarms()
+        finally:
+            server.DB.query = original_query
+
+        self.assertEqual(len(server.DATA["alarms"]), 1)
+        alarm = server.DATA["alarms"][0]
+        self.assertEqual(alarm["deviceCode"], "T-9")
+        self.assertEqual(alarm["status"], "ACTIVE")
+        self.assertFalse(alarm["ack"])
+        self.assertTrue(server.RULE_ENGINE["state"][(1, "T-9")]["active"],
+                        "restored alarms must re-arm their rule state")
+
+    def test_restore_no_rows_is_noop(self):
+        original_query = server.DB.query
+        server.DB.query = lambda sql, params=(): None
+        try:
+            server.restore_active_alarms()
+        finally:
+            server.DB.query = original_query
+        self.assertEqual(len(server.DATA["alarms"]), 0)
 
 
 if __name__ == "__main__":
