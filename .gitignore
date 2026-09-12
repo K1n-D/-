@@ -6,6 +6,7 @@ logs/*
 *.db
 node_modules/
 dist/
+target/
 
 # Local runtime state and portable tools (never commit)
 work/
