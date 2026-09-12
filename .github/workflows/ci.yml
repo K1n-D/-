@@ -21,14 +21,24 @@ jobs:
       - name: Python syntax
         run: python -m compileall -q middleware/src simulated-devices/src edge-collector/src frontend-backend/backend
       - name: Middleware tests (MQTT stack, watchdog, normalization)
-        run: python -m unittest discover -s middleware/tests -p "test_*.py" -v
+        run: |
+          python -m unittest discover -s middleware/tests -p "test_*.py" -v 2>&1 | tee /tmp/middleware.log
+          exit ${PIPESTATUS[0]}
       - name: Device simulator tests
-        run: python -m unittest discover -s simulated-devices/tests -p "test_*.py" -v
+        run: |
+          python -m unittest discover -s simulated-devices/tests -p "test_*.py" -v 2>&1 | tee /tmp/devices.log
+          exit ${PIPESTATUS[0]}
       - name: Edge collector tests (live Modbus end-to-end)
-        run: python -m unittest discover -s edge-collector/tests -p "test_*.py" -v
+        run: |
+          python -m unittest discover -s edge-collector/tests -p "test_*.py" -v 2>&1 | tee /tmp/edge.log
+          exit ${PIPESTATUS[0]}
       - name: Backend message-handling tests
-        run: python -m unittest discover -s frontend-backend/backend/tests -p "test_*.py" -v
-
+        run: |
+          python -m unittest discover -s frontend-backend/backend/tests -p "test_*.py" -v 2>&1 | tee /tmp/backend.log
+          exit ${PIPESTATUS[0]}
+      - name: Surface failure tails as annotations
+        if: failure()
+        run: python .github/workflows/annotate_failures.py /tmp/middleware.log /tmp/devices.log /tmp/edge.log /tmp/backend.log
   frontend-build:
     runs-on: ubuntu-latest
     steps:
