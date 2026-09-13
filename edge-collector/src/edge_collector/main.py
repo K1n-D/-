@@ -44,13 +44,31 @@ def make_control_server(collector: CollectorDevice, host: str, control_port: int
         def log_message(self, *args):
             return
 
+        def _cors(self):
+            # The simulator console (port 5174) drives scenario switches from
+            # the browser, so it needs cross-origin access to this endpoint.
+            origin = self.headers.get("Origin", "")
+            allowed = {"http://127.0.0.1:5174", "http://localhost:5174"}
+            if origin in allowed:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+
         def _json(self, payload, status=200):
             raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
+            self._cors()
             self.end_headers()
             self.wfile.write(raw)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "http://127.0.0.1:5174"))
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.end_headers()
 
         def _modbus_session(self):
             from pymodbus.client import ModbusTcpClient

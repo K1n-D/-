@@ -1,6 +1,8 @@
 (() => {
   const API = window.SIMULATOR_API || 'http://127.0.0.1:8091';
-  const state = { devices: [], editing: null, log: JSON.parse(localStorage.getItem('simlab-log') || '[]') };
+  const GATEWAY_API = 'http://127.0.0.1:8093';
+  const SCENARIOS = [['normal', '正常波动'], ['high-temperature', '高温告警'], ['low-pressure', '低压告警']];
+  const state = { devices: [], editing: null, log: JSON.parse(localStorage.getItem('simlab-log') || '[]'), gatewayDevices: [], scenario: null };
   const $ = id => document.getElementById(id);
   const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
   const statusText = status => ({ONLINE:'运行中', OFFLINE:'已停用', RECONNECTING:'重连中'})[status] || '未知';
@@ -18,6 +20,36 @@
   function collectPoints() { const points = {}; document.querySelectorAll('.point-row').forEach(row => { const code = row.dataset.point; points[code] = {}; row.querySelectorAll('[data-field]').forEach(input => { points[code][input.dataset.field] = input.dataset.field === 'unit' ? input.value : Number(input.value); }); }); return points; }
   async function saveDevice(event) { event.preventDefault(); const points = collectPoints(); if (!Object.keys(points).length) return toast('至少添加一个测点'); const payload = { deviceCode: $('deviceCode').value.trim().toUpperCase(), name: $('deviceName').value.trim(), deviceType: $('deviceType').value, scenario: $('scenario').value, enabled: $('enabled').checked, intervalSec: Number($('intervalSec').value), heartbeatIntervalSec: Number($('heartbeatSec').value), points }; $('saveBtn').disabled = true; try { if (state.editing) { await request(`/api/devices/${encodeURIComponent(state.editing)}`, { method: 'PUT', body: JSON.stringify(payload) }); addLog(`修改 ${payload.deviceCode}`); toast('设备配置已更新'); } else { await request('/api/devices', { method: 'POST', body: JSON.stringify(payload) }); addLog(`新增 ${payload.deviceCode}`); toast('设备已添加'); } closeModal(); await load(); } catch (error) { toast(error.message); } finally { $('saveBtn').disabled = false; } }
   async function operate(code, action) { try { if (action === 'delete' && !window.confirm(`确定删除 ${code} 吗？`)) return; const label = action === 'delete' ? '删除' : action === 'toggle' ? '切换状态' : action; await request(`/api/devices/${encodeURIComponent(code)}${action === 'toggle' ? '/toggle' : ''}`, { method: action === 'delete' ? 'DELETE' : 'POST' }); addLog(`${label} ${code}`); toast(`${label}成功`); await load(); } catch (error) { toast(error.message); } }
-  async function load() { try { const health = await request('/health'); $('serviceStatus').textContent = health.status === 'UP' ? '在线' : '异常'; state.devices = await request('/api/devices'); renderDevices(); $('syncLabel').textContent = `最后同步 ${new Date().toLocaleTimeString('zh-CN')}`; } catch (error) { $('serviceStatus').textContent = '未连接'; $('deviceGrid').innerHTML = ''; toast('控制服务未启动，请运行 start-all.ps1'); } }
-  $('addBtn').addEventListener('click', () => openModal()); $('refreshBtn').addEventListener('click', load); $('closeModal').addEventListener('click', closeModal); $('cancelBtn').addEventListener('click', closeModal); $('deviceForm').addEventListener('submit', saveDevice); $('searchInput').addEventListener('input', renderDevices); $('statusFilter').addEventListener('change', renderDevices); $('clearLogBtn').addEventListener('click', () => { state.log = []; localStorage.removeItem('simlab-log'); renderLog(); }); $('deviceGrid').addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (!button) return; const device = state.devices.find(item => item.deviceCode === button.dataset.code); if (button.dataset.action === 'edit') openModal(device); else operate(button.dataset.code, button.dataset.action); }); $('addPointBtn').addEventListener('click', () => { const input = $('newPoint'); const code = input.value.trim().toLowerCase(); if (!code || document.querySelector(`[data-point="${CSS.escape(code)}"]`)) return; $('pointRows').insertAdjacentHTML('beforeend', pointRow(code, { base: 0, variation: 1, unit: '' })); input.value = ''; }); $('pointRows').addEventListener('click', event => { if (event.target.closest('.remove-point')) event.target.closest('.point-row').remove(); }); $('modal').addEventListener('click', event => { if (event.target === $('modal')) closeModal(); }); renderLog(); load(); window.setInterval(load, 3000);
+  async function load() { try { const health = await request('/health'); $('serviceStatus').textContent = health.status === 'UP' ? '在线' : '异常'; state.devices = await request('/api/devices'); renderDevices(); updateGatewayNote(); $('syncLabel').textContent = `最后同步 ${new Date().toLocaleTimeString('zh-CN')}`; } catch (error) { $('serviceStatus').textContent = '未连接'; $('deviceGrid').innerHTML = ''; toast('控制服务未启动，请运行 start-all.ps1'); } }
+  async function loadGateway() {
+    try {
+      const health = await window.fetch(`${GATEWAY_API}/health`).then(r => r.json());
+      state.gatewayDevices = health.devices || [];
+      try { state.scenario = (await window.fetch(`${GATEWAY_API}/api/scenario`).then(r => r.json())).scenario; } catch { state.scenario = null; }
+      $('modbusEmpty').classList.add('hidden');
+    } catch {
+      state.gatewayDevices = []; state.scenario = null;
+      $('modbusEmpty').classList.remove('hidden');
+    }
+    renderGateway();
+  }
+  function updateGatewayNote() { $('gatewayNote').textContent = `工业监控台设备总数 ${state.devices.length + state.gatewayDevices.length} = 模拟器 ${state.devices.length} + Modbus ${state.gatewayDevices.length}`; }
+  function renderGateway() {
+    const grid = $('modbusGrid');
+    grid.innerHTML = state.gatewayDevices.map(code => {
+      const buttons = SCENARIOS.map(([value, label]) =>
+        `<button class="small-outline${state.scenario === value ? ' scenario-active' : ''}" data-scenario="${value}"${state.scenario === null ? ' disabled' : ''}>${label}</button>`).join('');
+      return `<article class="device-card"><div class="device-head"><div class="device-title"><strong>${escapeHtml(code)}</strong><small>Modbus TCP · 点位表采集</small></div><span class="status-pill online">网关接入</span></div><div class="device-meta"><span>当前场景<b>${escapeHtml(state.scenario ?? '未知')}</b></span><span>切换方式<b>写寄存器 HR15</b></span></div><div class="scenario-actions">${buttons}</div></article>`;
+    }).join('');
+    updateGatewayNote();
+  }
+  async function switchScenario(scenario) {
+    try {
+      await window.fetch(`${GATEWAY_API}/api/scenario`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scenario }) });
+      addLog(`Modbus 场景切换 → ${scenario}`);
+      toast(`场景已切换：${scenario}`);
+      await loadGateway();
+    } catch { toast('场景切换失败：网关未启动'); }
+  }
+  $('addBtn').addEventListener('click', () => openModal()); $('refreshBtn').addEventListener('click', load); $('closeModal').addEventListener('click', closeModal); $('cancelBtn').addEventListener('click', closeModal); $('deviceForm').addEventListener('submit', saveDevice); $('searchInput').addEventListener('input', renderDevices); $('statusFilter').addEventListener('change', renderDevices); $('clearLogBtn').addEventListener('click', () => { state.log = []; localStorage.removeItem('simlab-log'); renderLog(); }); $('deviceGrid').addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (!button) return; const device = state.devices.find(item => item.deviceCode === button.dataset.code); if (button.dataset.action === 'edit') openModal(device); else operate(button.dataset.code, button.dataset.action); }); $('addPointBtn').addEventListener('click', () => { const input = $('newPoint'); const code = input.value.trim().toLowerCase(); if (!code || document.querySelector(`[data-point="${CSS.escape(code)}"]`)) return; $('pointRows').insertAdjacentHTML('beforeend', pointRow(code, { base: 0, variation: 1, unit: '' })); input.value = ''; }); $('pointRows').addEventListener('click', event => { if (event.target.closest('.remove-point')) event.target.closest('.point-row').remove(); }); $('modal').addEventListener('click', event => { if (event.target === $('modal')) closeModal(); }); $('modbusGrid').addEventListener('click', event => { const button = event.target.closest('button[data-scenario]'); if (button) switchScenario(button.dataset.scenario); }); renderLog(); load(); loadGateway(); window.setInterval(load, 3000); window.setInterval(loadGateway, 5000);
 })();
