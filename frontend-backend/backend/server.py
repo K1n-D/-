@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, logging, os, queue, sys, threading, time
+import hmac, json, logging, os, queue, secrets, sys, threading, time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,12 +23,66 @@ ROOT = Path(__file__).resolve().parents[2]
 # thresholds here any more.
 MAX_ALARMS = int(os.getenv("IOT_MAX_ALARMS", "200"))
 
-# Set IOT_AUTH_ENABLED=1 to require a Bearer token on data APIs. Off by default
-# so the local demo works out of the box; the login flow is unchanged.
-AUTH_ENABLED = os.getenv("IOT_AUTH_ENABLED", "0").lower() in {"1", "true", "yes"}
-AUTH_TOKEN = os.getenv("IOT_AUTH_TOKEN", "local-demo-token")
+# Authentication is on by default: every data API (and the SSE stream)
+# requires a Bearer token issued by /api/auth/login. Tokens are random,
+# expire after TOKEN_TTL_SECONDS and die with the process. Set
+# IOT_AUTH_ENABLED=0 for a no-login local demo.
+AUTH_ENABLED = os.getenv("IOT_AUTH_ENABLED", "1").lower() in {"1", "true", "yes"}
+TOKEN_TTL_SECONDS = int(os.getenv("IOT_TOKEN_TTL_SECONDS", str(8 * 3600)))
 ADMIN_USER = os.getenv("IOT_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("IOT_ADMIN_PASSWORD", "admin123")
+
+# issued tokens: token -> expiry (monotonic wall clock)
+ACTIVE_TOKENS: dict = {}
+# naive per-IP login throttle: consecutive failures lock the source out
+LOGIN_FAILURES: dict = {}
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 300.0
+
+
+def issue_token():
+    token = secrets.token_urlsafe(32)
+    ACTIVE_TOKENS[token] = time.time() + TOKEN_TTL_SECONDS
+    return token
+
+
+def token_valid(token):
+    expiry = ACTIVE_TOKENS.get(token)
+    if expiry is None:
+        return False
+    if time.time() > expiry:
+        ACTIVE_TOKENS.pop(token, None)
+        return False
+    return True
+
+
+def revoke_token(token):
+    ACTIVE_TOKENS.pop(token, None)
+
+
+def login_allowed(client_ip):
+    entry = LOGIN_FAILURES.get(client_ip)
+    if not entry:
+        return True
+    count, locked_until = entry
+    if count < LOGIN_MAX_FAILURES:
+        return True
+    if time.time() >= locked_until:
+        LOGIN_FAILURES.pop(client_ip, None)
+        return True
+    return False
+
+
+def record_login_failure(client_ip):
+    count, _ = LOGIN_FAILURES.get(client_ip, (0, 0.0))
+    count += 1
+    locked_until = time.time() + LOGIN_LOCKOUT_SECONDS if count >= LOGIN_MAX_FAILURES else 0.0
+    LOGIN_FAILURES[client_ip] = (count, locked_until)
+    return locked_until
+
+
+def record_login_success(client_ip):
+    LOGIN_FAILURES.pop(client_ip, None)
 
 # The browser pages live on 5173; anything else is not entitled to read the API
 # cross-origin. Override with IOT_CORS_ORIGINS if the demo is served elsewhere.
@@ -789,8 +843,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def client_ip(self):
+        return self.client_address[0]
+
+    def bearer_token(self):
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            return header[7:].strip()
+        return None
+
     def require_auth(self):
-        if not AUTH_ENABLED or self.headers.get("Authorization") == f"Bearer {AUTH_TOKEN}":
+        """Bearer-token gate for data APIs. Exempts health/auth so probes and
+        the login flow itself stay reachable."""
+        if not AUTH_ENABLED:
+            return True
+        token = self.bearer_token()
+        if token and token_valid(token):
             return True
         self.send_json({"error": "unauthorized"}, 401)
         return False
@@ -866,7 +934,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json({"error": "not found"}, 404)
 
     def stream_events(self):
-        """Serve one Server-Sent Events connection until the client hangs up."""
+        """Serve one Server-Sent Events connection until the client hangs up.
+
+        EventSource cannot send headers, so the token arrives as a query
+        parameter and is validated before the stream opens."""
+        if AUTH_ENABLED:
+            params = parse_qs(urlparse(self.path).query)
+            token = (params.get("token") or [None])[0]
+            if not token or not token_valid(token):
+                return self.send_json({"error": "unauthorized"}, 401)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -900,6 +976,8 @@ class Handler(BaseHTTPRequestHandler):
         return body if isinstance(body, dict) else None
 
     def do_PUT(self):
+        if not self.require_auth():
+            return
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         if len(parts) == 4 and parts[:2] == ["api", "points"]:
@@ -921,6 +999,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json({"error": "not found"}, 404)
 
     def do_DELETE(self):
+        if not self.require_auth():
+            return
         parts = urlparse(self.path).path.strip("/").split("/")
         if len(parts) == 3 and parts[:2] == ["api", "alarm-rules"] and parts[2].isdigit():
             if DB.alarm_rule_delete(int(parts[2])):
@@ -931,6 +1011,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path not in ("/api/auth/login", "/api/auth/logout") and not self.require_auth():
+            return
         if path == "/api/alarm-rules":
             body = self.read_body()
             if not body:
@@ -967,9 +1049,27 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.read_body()
             if not payload:
                 return self.send_json({"error": "invalid request"}, 400)
-            if payload.get("username") != ADMIN_USER or payload.get("password") != ADMIN_PASSWORD:
+            ip = self.client_ip()
+            if not login_allowed(ip):
+                retry = int(LOGIN_FAILURES.get(ip, (0, 0.0))[1] - time.time()) + 1
+                logging.warning("login throttled for %s", ip)
+                return self.send_json({"error": f"too many failed attempts, retry in {retry}s"}, 429)
+            user_ok = hmac.compare_digest(str(payload.get("username", "")), ADMIN_USER)
+            pass_ok = hmac.compare_digest(str(payload.get("password", "")), ADMIN_PASSWORD)
+            if not (user_ok and pass_ok):
+                locked_until = record_login_failure(ip)
+                if locked_until:
+                    logging.warning("login lockout engaged for %s", ip)
                 return self.send_json({"error": "invalid credentials"}, 401)
-            return self.send_json({"token": AUTH_TOKEN, "user": {"username": ADMIN_USER, "role": "ADMIN"}})
+            record_login_success(ip)
+            return self.send_json({"token": issue_token(),
+                                   "user": {"username": ADMIN_USER, "role": "ADMIN"},
+                                   "expiresInSeconds": TOKEN_TTL_SECONDS})
+        if path == "/api/auth/logout":
+            token = self.bearer_token()
+            if token:
+                revoke_token(token)
+            return self.send_json({"ok": True})
         return self.send_json({"error": "not found"}, 404)
 
 

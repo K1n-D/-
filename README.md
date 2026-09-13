@@ -75,6 +75,10 @@ python -m sim_devices.main --scenario heartbeat-loss
 - 告警规则:`temperature` 测点超过 90 触发 SERIOUS 告警,回落到阈值以下自动恢复,并持久化到 `iot_alarm_record`。
 - 历史数据:`/api/history` 优先查询 MySQL(`iot_history_data`),数据库不可用时回退内存最近 100 条。
 
-常用环境变量:`IOT_ADMIN_USER` / `IOT_ADMIN_PASSWORD`(登录凭据,默认 admin/admin123)、`IOT_ALARM_TEMPERATURE_THRESHOLD`(告警阈值,默认 90)、`IOT_AUTH_ENABLED=1`(数据接口要求 Bearer Token)、`IOT_CORS_ORIGINS`(允许跨域来源,默认本机 5173)、`IOT_DB_*`(MySQL 连接与开关)。
+常用环境变量:`IOT_ADMIN_USER` / `IOT_ADMIN_PASSWORD`(登录凭据,默认 admin/admin123)、`IOT_TOKEN_TTL_SECONDS`(登录令牌有效期,默认 8 小时)、`IOT_ALARM_TEMPERATURE_THRESHOLD`(告警阈值,默认 90)、`IOT_AUTH_ENABLED`(数据接口鉴权开关,**默认开启**)、`IOT_CORS_ORIGINS`(允许跨域来源,默认本机 5173)、`IOT_DB_*`(MySQL 连接与开关)、`IOT_HISTORY_RETENTION_DAYS`(历史数据保留天数,默认 7)。
+
+## 登录与鉴权
+
+监控台需登录后访问(admin / admin123)。登录成功后后端签发随机令牌(8 小时过期,重启即失效),所有数据接口与 SSE 实时流均校验该令牌;连续 5 次密码错误将锁定来源 IP 5 分钟。`IOT_AUTH_ENABLED=0` 可关闭鉴权用于本地调试。
 
 日志位于 `logs/`,可直接用于测试报告截图和问题定位。

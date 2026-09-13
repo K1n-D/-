@@ -102,7 +102,7 @@ function statusClass(status?: string) { return status === 'ONLINE' ? 'online' : 
 function alarmLevel(level?: string) { return level === 'SERIOUS' ? '严重' : level === 'WARNING' ? '警告' : '提示' }
 async function request(path: string, options?: RequestInit) { const headers = new Headers(options?.headers); if (token.value) headers.set('Authorization', `Bearer ${token.value}`); const response = await fetch(`${api}${path}`, { ...options, headers }); if (response.status === 401) { logout(); throw new Error('登录已过期') } if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.json() }
 async function login() { loginBusy.value = true; loginError.value = ''; try { const result = await request('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: loginName.value, password: loginPassword.value }) }); token.value = result.token; username.value = result.user?.username || loginName.value; localStorage.setItem('iot-monitor-token', token.value); localStorage.setItem('iot-monitor-user', username.value); await load() } catch { loginError.value = '账号或密码错误，请重试' } finally { loginBusy.value = false } }
-function logout() { token.value = ''; localStorage.removeItem('iot-monitor-token'); localStorage.removeItem('iot-monitor-user') }
+function logout() { if (token.value) { try { fetch(`${api}/api/auth/logout`, { method: 'POST', headers: { Authorization: `Bearer ${token.value}` }, keepalive: true }) } catch { /* best effort */ } } token.value = ''; localStorage.removeItem('iot-monitor-token'); localStorage.removeItem('iot-monitor-user') }
 async function load() {
   if (!token.value) return
   try {
@@ -141,7 +141,8 @@ async function savePoint(row: any) {
 }
 function connectStream() {
   stream?.close()
-  stream = new EventSource(`${api}/api/stream`)
+  // EventSource cannot send headers, so the token rides in the query string
+  stream = new EventSource(`${api}/api/stream?token=${encodeURIComponent(token.value)}`)
   stream.onmessage = event => {
     try {
       const reading = JSON.parse(event.data)

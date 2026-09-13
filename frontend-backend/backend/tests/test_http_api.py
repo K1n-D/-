@@ -109,6 +109,8 @@ class FakeDB:
 class HttpApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.original_enabled = server.AUTH_ENABLED
+        server.AUTH_ENABLED = False  # auth behaviour is covered by test_auth.py
         cls.original_db = server.DB
         cls.http_db = FakeDB()
         server.DB = cls.http_db
@@ -126,6 +128,7 @@ class HttpApiTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.http_server.shutdown()
         server.DB = cls.original_db
+        server.AUTH_ENABLED = cls.original_enabled
 
     def setUp(self):
         server.DATA["devices"].clear()
