@@ -1,7 +1,7 @@
 (() => {
   const API = window.SIMULATOR_API || 'http://127.0.0.1:8091';
   const GATEWAY_API = 'http://127.0.0.1:8093';
-  const SCENARIOS = [['normal', '正常波动'], ['high-temperature', '高温告警'], ['low-pressure', '低压告警']];
+  const SCENARIOS = [['normal', '正常波动'], ['high-temperature', '高温告警'], ['low-pressure', '低压告警'], ['high-vibration', '振动异常']];
   const state = { devices: [], editing: null, log: JSON.parse(localStorage.getItem('simlab-log') || '[]'), gatewayDevices: [], scenario: null };
   const $ = id => document.getElementById(id);
   const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));

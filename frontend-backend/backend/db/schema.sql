@@ -86,9 +86,15 @@ CREATE TABLE IF NOT EXISTS iot_point_config (
 INSERT IGNORE INTO iot_point_config
   (device_code, point_code, slave_id, register, register_type, scale_factor, dead_zone, collect_interval_ms, unit)
 VALUES
-  ('MODBUS-PLC-001', 'temperature', 1, 0, 'holding', 0.1, 0.1, 1000, 'C'),
-  ('MODBUS-PLC-001', 'pressure',    1, 1, 'holding', 0.001, 0.002, 1000, 'MPa'),
-  ('MODBUS-TANK-001', 'liquid_level', 1, 2, 'holding', 0.1, 0.2, 2000, '%');
+  ('MODBUS-PLC-001', 'temperature',   1, 0, 'holding', 0.1,   0.1,   1000, 'C'),
+  ('MODBUS-PLC-001', 'pressure',      1, 1, 'holding', 0.001, 0.002, 1000, 'MPa'),
+  ('MODBUS-PLC-001', 'vibration',     1, 4, 'holding', 0.01,  0.02,  1000, 'mm/s'),
+  ('MODBUS-PLC-001', 'current',       1, 5, 'holding', 0.1,   0.05,  1000, 'A'),
+  ('MODBUS-PLC-001', 'rpm',           1, 6, 'holding', 1,     5,     1000, 'rpm'),
+  ('MODBUS-TANK-001', 'liquid_level', 1, 2, 'holding', 0.1,   0.2,   2000, '%'),
+  ('MODBUS-TANK-001', 'flow',         1, 7, 'holding', 0.01,  0.05,  2000, 'm3/h'),
+  ('MODBUS-TANK-001', 'humidity',     1, 8, 'holding', 0.1,   0.3,   2000, '%RH'),
+  ('MODBUS-TANK-001', 'valve_position', 1, 9, 'holding', 0.1, 0.5,   2000, '%');
 
 -- 告警规则:阈值/滞回/持续时间,由后端规则引擎消费。
 CREATE TABLE IF NOT EXISTS iot_alarm_rule (
@@ -107,4 +113,8 @@ CREATE TABLE IF NOT EXISTS iot_alarm_rule (
 INSERT IGNORE INTO iot_alarm_rule
   (device_code, point_code, operator, threshold, duration_sec, hysteresis, level)
 VALUES
-  ('*', 'temperature', '>', 90, 10, 5, 'SERIOUS');
+  ('*', 'temperature', '>', 90, 10, 5, 'SERIOUS'),
+  ('MODBUS-PLC-001', 'vibration', '>', 8, 5, 1, 'WARNING'),
+  ('MODBUS-PLC-001', 'current', '>', 15, 10, 0.5, 'WARNING'),
+  ('MODBUS-TANK-001', 'liquid_level', '>', 90, 10, 3, 'WARNING'),
+  ('MODBUS-TANK-001', 'liquid_level', '<', 20, 10, 3, 'SERIOUS');

@@ -89,7 +89,7 @@ class LogicTests(unittest.TestCase):
 
     def test_point_table_loads_and_validates(self):
         table = load_point_table(Path(__file__).resolve().parents[1] / "configs" / "point-table.yml")
-        self.assertEqual(len(table.points), 3)
+        self.assertEqual(len(table.points), 9)
         self.assertEqual(table.points[0].device_code, "MODBUS-PLC-001")
         self.assertEqual(table.points[1].scale_factor, 0.001)
 

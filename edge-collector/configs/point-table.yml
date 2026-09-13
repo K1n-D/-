@@ -27,6 +27,36 @@ points:
     collect_interval_ms: 1000
     unit: MPa
 
+  - device_code: MODBUS-PLC-001
+    point_code: vibration
+    register: 4
+    slave_id: 1
+    register_type: holding
+    scale_factor: 0.01       # HR4 = vibration x 100
+    dead_zone: 0.02
+    collect_interval_ms: 1000
+    unit: mm/s
+
+  - device_code: MODBUS-PLC-001
+    point_code: current
+    register: 5
+    slave_id: 1
+    register_type: holding
+    scale_factor: 0.1        # HR5 = current x 10
+    dead_zone: 0.05
+    collect_interval_ms: 1000
+    unit: A
+
+  - device_code: MODBUS-PLC-001
+    point_code: rpm
+    register: 6
+    slave_id: 1
+    register_type: holding
+    scale_factor: 1          # HR6 = rpm, unscaled
+    dead_zone: 5
+    collect_interval_ms: 1000
+    unit: rpm
+
   - device_code: MODBUS-TANK-001
     point_code: liquid_level
     register: 2
@@ -34,5 +64,35 @@ points:
     register_type: holding
     scale_factor: 0.1        # HR2 = liquid level x 10
     dead_zone: 0.2
+    collect_interval_ms: 2000
+    unit: "%"
+
+  - device_code: MODBUS-TANK-001
+    point_code: flow
+    register: 7
+    slave_id: 1
+    register_type: holding
+    scale_factor: 0.01       # HR7 = flow x 100
+    dead_zone: 0.05
+    collect_interval_ms: 2000
+    unit: m3/h
+
+  - device_code: MODBUS-TANK-001
+    point_code: humidity
+    register: 8
+    slave_id: 1
+    register_type: holding
+    scale_factor: 0.1        # HR8 = humidity x 10
+    dead_zone: 0.3
+    collect_interval_ms: 2000
+    unit: "%RH"
+
+  - device_code: MODBUS-TANK-001
+    point_code: valve_position
+    register: 9
+    slave_id: 1
+    register_type: holding
+    scale_factor: 0.1        # HR9 = valve position x 10
+    dead_zone: 0.5
     collect_interval_ms: 2000
     unit: "%"
