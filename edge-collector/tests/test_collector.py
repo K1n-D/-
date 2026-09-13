@@ -1,5 +1,6 @@
 import os
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -10,7 +11,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(ROOT / "middleware" / "src"))
 
-from edge_collector.collector import CollectorDevice, engineering_value, read_point, should_report
+from edge_collector.collector import (
+    CollectorDevice, decode_register_value, engineering_value, merge_blocks,
+    read_point, should_report)
 from edge_collector.point_table import GatewayConfig, PointConfig, load_point_table
 from edge_collector.registers import RegisterImage
 
@@ -31,6 +34,47 @@ class FakeMqtt:
 
     def publish(self, topic, payload, qos=1, retain=False):
         self.published.append((topic, payload, retain))
+
+
+class DecodeTests(unittest.TestCase):
+    def test_int16_signedness(self):
+        # 0xFF9E is -98 as int16 but 65438 as uint16
+        self.assertEqual(decode_register_value([0xFF9E], "int16", "ABCD"), -98)
+        self.assertEqual(decode_register_value([0xFF9E], "uint16", "ABCD"), 65438)
+
+    @staticmethod
+    def words_for_order(value_bytes, order):
+        """Lay the big-endian byte sequence of a 32-bit value into two
+        registers according to the named industry byte order."""
+        hi, lo = (value_bytes[0] << 8) | value_bytes[1], (value_bytes[2] << 8) | value_bytes[3]
+        return {"ABCD": [hi, lo], "CDAB": [lo, hi],
+                "BADC": [((hi & 0xFF) << 8) | (hi >> 8), ((lo & 0xFF) << 8) | (lo >> 8)],
+                "DCBA": [((lo & 0xFF) << 8) | (lo >> 8), ((hi & 0xFF) << 8) | (hi >> 8)]}[order]
+
+    def test_int32_all_byte_orders(self):
+        raw = struct.pack(">i", -987654)  # any value; each layout must recover it
+        for order in ("ABCD", "CDAB", "BADC", "DCBA"):
+            words = self.words_for_order(raw, order)
+            self.assertEqual(decode_register_value(words, "int32", order), -987654, order)
+
+    def test_float32_all_byte_orders(self):
+        raw = struct.pack(">f", 123.45)
+        for order in ("ABCD", "CDAB", "BADC", "DCBA"):
+            words = self.words_for_order(raw, order)
+            self.assertAlmostEqual(decode_register_value(words, "float32", order), 123.45, places=3, msg=order)
+
+    def test_merge_blocks_merges_neighbouring_registers(self):
+        points = [PointConfig(device_code="D", point_code=f"p{i}", register=addr, register_count=1)
+                  for i, addr in enumerate((0, 1, 2, 5))]
+        blocks = merge_blocks(points)
+        self.assertEqual([(b["start"], b["end"]) for b in blocks], [(0, 2), (5, 5)])
+
+    def test_merge_blocks_respects_register_count(self):
+        points = [PointConfig(device_code="D", point_code="a", register=0, register_count=2),
+                  PointConfig(device_code="D", point_code="b", register=2, register_count=1)]
+        blocks = merge_blocks(points)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual((blocks[0]["start"], blocks[0]["end"]), (0, 2))
 
 
 class LogicTests(unittest.TestCase):

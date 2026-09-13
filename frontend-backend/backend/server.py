@@ -86,6 +86,17 @@ class Persistence:
                 logging.warning("database unavailable, using memory fallback: %s", exc)
                 return False
 
+    def _ensure_column(self, cur, table, column, ddl):
+        """CREATE TABLE IF NOT EXISTS cannot add columns to an existing table,
+        so schema evolution columns are migrated explicitly."""
+        cur.execute(
+            """SELECT COUNT(*) FROM information_schema.COLUMNS
+               WHERE table_schema=DATABASE() AND table_name=%s AND column_name=%s""",
+            (table, column))
+        if cur.fetchone()[0] == 0:
+            logging.info("migrating %s: adding column %s", table, column)
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
     def _ensure_schema(self):
         candidates = [
             Path(__file__).resolve().parent / "db" / "schema.sql",
@@ -101,15 +112,13 @@ class Persistence:
         try:
             for statement in statements:
                 cur.execute(statement)
-            # CREATE TABLE IF NOT EXISTS cannot add columns to an existing
-            # table, so the ack columns added later get migrated explicitly.
-            cur.execute(
-                """SELECT COUNT(*) FROM information_schema.COLUMNS
-                   WHERE table_schema=DATABASE() AND table_name='iot_alarm_record'
-                         AND column_name='ack_time'""")
-            if cur.fetchone()[0] == 0:
-                logging.info("migrating iot_alarm_record: adding ack columns")
-                cur.execute("ALTER TABLE iot_alarm_record ADD COLUMN ack_time TIMESTAMP NULL, ADD COLUMN ack_by VARCHAR(64) NULL")
+            self._ensure_column(cur, "iot_alarm_record", "ack_time", "TIMESTAMP NULL")
+            self._ensure_column(cur, "iot_alarm_record", "ack_by", "VARCHAR(64) NULL")
+            # Point-table columns borrowed from thingsboard-gateway's design:
+            # multi-register values with configurable byte order.
+            self._ensure_column(cur, "iot_point_config", "data_type", "VARCHAR(16) NOT NULL DEFAULT 'uint16'")
+            self._ensure_column(cur, "iot_point_config", "byte_order", "VARCHAR(8) NOT NULL DEFAULT 'ABCD'")
+            self._ensure_column(cur, "iot_point_config", "register_count", "INT NOT NULL DEFAULT 1")
         finally:
             cur.close()
 
@@ -165,18 +174,21 @@ class Persistence:
     def point_configs(self):
         rows = self.query(
             """SELECT device_code, point_code, slave_id, register, register_type,
-                      scale_factor, dead_zone, collect_interval_ms, unit, enabled
+                      data_type, byte_order, register_count, scale_factor, dead_zone,
+                      collect_interval_ms, unit, enabled
                FROM iot_point_config ORDER BY device_code, point_code""")
         if rows is None:
             return None
         return [{"deviceCode": d, "pointCode": p, "slaveId": s, "register": r,
-                 "registerType": t, "scaleFactor": float(sf), "deadZone": float(dz),
+                 "registerType": t, "dataType": dt, "byteOrder": bo, "registerCount": rc,
+                 "scaleFactor": float(sf), "deadZone": float(dz),
                  "collectIntervalMs": ci, "unit": u, "enabled": bool(en)}
-                for d, p, s, r, t, sf, dz, ci, u, en in rows]
+                for d, p, s, r, t, dt, bo, rc, sf, dz, ci, u, en in rows]
 
     POINT_EDITABLE = {"scale_factor": "scaleFactor", "dead_zone": "deadZone",
                       "collect_interval_ms": "collectIntervalMs", "unit": "unit",
-                      "enabled": "enabled"}
+                      "enabled": "enabled", "data_type": "dataType",
+                      "byte_order": "byteOrder"}
 
     def update_point(self, device_code, point_code, fields):
         """Apply a partial update to one point-table row (whitelisted columns)."""
@@ -191,6 +203,17 @@ class Persistence:
                 value = 1 if value else 0
             elif column == "collect_interval_ms":
                 value = max(200, int(value))
+            elif column == "data_type":
+                value = str(value)[:16]
+                if value not in ("int16", "uint16", "int32", "float32"):
+                    return False
+                # the register span follows the data type automatically
+                sets.append("register_count=%s")
+                params.append(2 if value in ("int32", "float32") else 1)
+            elif column == "byte_order":
+                value = str(value)[:8]
+                if value not in ("ABCD", "CDAB", "BADC", "DCBA"):
+                    return False
             else:
                 value = float(value)
             sets.append(f"{column}=%s")

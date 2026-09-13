@@ -140,7 +140,8 @@ def load_points_from_db():
         cur = conn.cursor()
         cur.execute(
             """SELECT device_code, point_code, slave_id, register, register_type,
-                      scale_factor, dead_zone, collect_interval_ms, unit
+                      data_type, byte_order, register_count, scale_factor, dead_zone,
+                      collect_interval_ms, unit
                FROM iot_point_config WHERE enabled=1 ORDER BY device_code, point_code""")
         rows = cur.fetchall()
         cur.close()
@@ -150,8 +151,9 @@ def load_points_from_db():
         return None
     conn.close()
     return [PointConfig(device_code=r[0], point_code=r[1], slave_id=r[2], register=r[3],
-                        register_type=r[4], scale_factor=float(r[5]), dead_zone=float(r[6]),
-                        collect_interval_ms=r[7], unit=r[8]) for r in rows]
+                        register_type=r[4], data_type=r[5], byte_order=r[6],
+                        register_count=r[7], scale_factor=float(r[8]), dead_zone=float(r[9]),
+                        collect_interval_ms=r[10], unit=r[11]) for r in rows]
 
 
 def main():

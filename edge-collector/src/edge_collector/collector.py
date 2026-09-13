@@ -13,6 +13,8 @@ publishes a retained OFFLINE status, and publishes ONLINE again on recovery.
 from __future__ import annotations
 
 import logging
+import math
+import struct
 import threading
 import time
 
@@ -42,18 +44,66 @@ def should_report(value, last_value, dead_zone):
     return abs(value - last_value) >= dead_zone
 
 
-def read_point(client, point: PointConfig):
-    """Read one point from the PLC. Returns (raw_int | None, error | None)."""
-    try:
-        if point.register_type == "input":
-            result = client.read_input_registers(point.register, count=1, slave=point.slave_id)
+def decode_register_value(registers, data_type, byte_order):
+    """Decode one or two raw registers into a signed/float value.
+
+    Byte orders follow the de-facto industry naming for 32-bit values, where
+    ABCD is the big-endian byte sequence of the value spread over two words:
+    ABCD (big-endian), CDAB (word swap), BADC (byte swap per word) and DCBA
+    (little-endian). Single-register types honour signedness only.
+    """
+    if data_type in ("int16", "uint16"):
+        packed = struct.pack(">H", registers[0] & 0xFFFF)
+        return struct.unpack(">h" if data_type == "int16" else ">H", packed)[0]
+    words = list(registers[:2])
+    if byte_order == "CDAB":
+        words = [words[1], words[0]]
+    elif byte_order == "BADC":
+        words = [((w & 0xFF) << 8) | ((w >> 8) & 0xFF) for w in words]
+    elif byte_order == "DCBA":
+        return struct.unpack("<f" if data_type == "float32" else "<i", struct.pack(">HH", *words))[0]
+    packed = struct.pack(">HH", *words)
+    return struct.unpack(">f" if data_type == "float32" else ">i", packed)[0]
+
+
+def merge_blocks(points):
+    """Group sorted points into contiguous Modbus read blocks (gap <= 2)."""
+    blocks = []
+    current = None
+    for point in sorted(points, key=lambda p: p.register):
+        end = point.register + point.register_count - 1
+        if current and point.register - current["end"] <= 2:
+            current["end"] = max(current["end"], end)
+            current["points"].append(point)
         else:
-            result = client.read_holding_registers(point.register, count=1, slave=point.slave_id)
+            current = {"start": point.register, "end": end, "points": [point]}
+            blocks.append(current)
+    return blocks
+
+
+def read_block(client, slave_id, register_type, start, count):
+    """Read one contiguous register block. Returns (list[int] | None, error | None)."""
+    try:
+        if register_type == "input":
+            result = client.read_input_registers(start, count=count, slave=slave_id)
+        else:
+            result = client.read_holding_registers(start, count=count, slave=slave_id)
         if result.isError():
             return None, str(result)
-        return int(result.registers[0]), None
+        return list(result.registers), None
     except Exception as exc:  # pymodbus raises broad exceptions on IO errors
         return None, str(exc)
+
+
+def read_point(client, point: PointConfig):
+    """Read and decode a single point. Returns (value | None, error | None)."""
+    registers, error = read_block(client, point.slave_id, point.register_type,
+                                  point.register, point.register_count)
+    if error is not None:
+        return None, error
+    if len(registers) < point.register_count:
+        return None, f"short read: {len(registers)} of {point.register_count} registers"
+    return decode_register_value(registers, point.data_type, point.byte_order), None
 
 
 class CollectorDevice:
@@ -149,25 +199,45 @@ class CollectorDevice:
             self.publish_status(code, "OFFLINE", "COLLECT_ERROR")
 
     def poll_once(self, now=None):
-        """One collection round. Returns the number of points read OK."""
+        """One collection round. Modbus transactions are merged per contiguous
+        register block (borrowed from thingsboard-gateway's batching) so
+        neighbouring points cost a single request instead of one each.
+        Returns the number of points read OK and the number failed."""
         now = time.monotonic() if now is None else now
         ok_reads = 0
         failed = 0
+        groups: dict = {}
         for point in self.points:
-            raw, error = read_point(self.modbus, point)
-            if error is not None:
-                failed += 1
-                continue
-            ok_reads += 1
-            value = engineering_value(raw, point.scale_factor)
-            key = (point.device_code, point.point_code)
-            last = self._last_values.get(key)
-            now_since_report = now - self._last_report.get(key, 0)
-            if (should_report(value, last, point.dead_zone) or now_since_report >= FORCED_REPORT_SEC) \
-                    and now_since_report >= point.collect_interval_ms / 1000:
-                self.publish_telemetry(point, value)
-                self._last_values[key] = value
-                self._last_report[key] = now
+            groups.setdefault((point.slave_id, point.register_type), []).append(point)
+        for (slave_id, register_type), points in groups.items():
+            for block in merge_blocks(points):
+                count = block["end"] - block["start"] + 1
+                registers, error = read_block(self.modbus, slave_id, register_type,
+                                              block["start"], count)
+                if error is not None:
+                    failed += len(block["points"])
+                    continue
+                for point in block["points"]:
+                    offset = point.register - block["start"]
+                    raw = registers[offset:offset + point.register_count]
+                    if len(raw) < point.register_count:
+                        failed += 1
+                        continue
+                    value = engineering_value(
+                        decode_register_value(raw, point.data_type, point.byte_order),
+                        point.scale_factor)
+                    if not math.isfinite(value):
+                        failed += 1
+                        continue
+                    ok_reads += 1
+                    key = (point.device_code, point.point_code)
+                    last = self._last_values.get(key)
+                    now_since_report = now - self._last_report.get(key, 0)
+                    if (should_report(value, last, point.dead_zone) or now_since_report >= FORCED_REPORT_SEC) \
+                            and now_since_report >= point.collect_interval_ms / 1000:
+                        self.publish_telemetry(point, value)
+                        self._last_values[key] = value
+                        self._last_report[key] = now
         return ok_reads, failed
 
     def run(self):

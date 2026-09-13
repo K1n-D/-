@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 
 import yaml
 
+DATA_TYPES = ("int16", "uint16", "int32", "float32")
+BYTE_ORDERS = ("ABCD", "CDAB", "BADC", "DCBA")
+COUNT_FOR_TYPE = {"int16": 1, "uint16": 1, "int32": 2, "float32": 2}
+
 
 @dataclass
 class PointConfig:
@@ -13,10 +17,21 @@ class PointConfig:
     register: int
     slave_id: int = 1
     register_type: str = "holding"      # holding | input
+    data_type: str = "uint16"           # int16 | uint16 | int32 | float32
+    byte_order: str = "ABCD"            # ABCD | CDAB | BADC | DCBA (multi-register)
+    register_count: int = 1             # derived from data_type when omitted
     scale_factor: float = 1.0           # engineering value = raw * scale_factor
     dead_zone: float = 0.0              # report only when |value - last| >= dead_zone
     collect_interval_ms: int = 1000
     unit: str = ""
+
+    def __post_init__(self):
+        if self.data_type not in DATA_TYPES:
+            raise ValueError(f"unsupported data_type {self.data_type!r}")
+        if self.byte_order not in BYTE_ORDERS:
+            raise ValueError(f"unsupported byte_order {self.byte_order!r}")
+        if not self.register_count:
+            self.register_count = COUNT_FOR_TYPE[self.data_type]
 
     @staticmethod
     def from_dict(payload):
@@ -30,6 +45,9 @@ class PointConfig:
             register=int(payload["register"]),
             slave_id=int(payload.get("slave_id", 1)),
             register_type=str(payload.get("register_type", "holding")),
+            data_type=str(payload.get("data_type", "uint16")),
+            byte_order=str(payload.get("byte_order", "ABCD")),
+            register_count=int(payload.get("register_count") or 0),
             scale_factor=float(payload.get("scale_factor", 1.0)),
             dead_zone=float(payload.get("dead_zone", 0.0)),
             collect_interval_ms=max(200, int(payload.get("collect_interval_ms", 1000))),
